@@ -103,6 +103,10 @@ void QmlPlayerBridge::setFgBackendName(const QString& value) {
         return;
     }
     s.frameGenerationBackend = want;
+    // 固定目标帧率 exists only on VFG (the per-pair adaptive count is wired to that
+    // backend). Leaving it clears the mode instead of storing one nothing reads.
+    const bool clearedFixedTarget = want != engine::FrameGenerationBackend::Vfg && s.fgFixedTarget.enabled;
+    if (clearedFixedTarget) s.fgFixedTarget.enabled = false;
     // A DLSS multiplier above XeSS's ceiling used to make the switch fail
     // silently in effect (the backend stayed DLSS). Clamp to the ceiling instead.
     auto& chain = impl_->chain;
@@ -116,6 +120,10 @@ void QmlPlayerBridge::setFgBackendName(const QString& value) {
         emit notice(tr("补帧后端切换未被接受，原设置保留"),true);return;
     }
     if (clamped) emit notice(tr("所选补帧后端的倍率已调整为 %1X").arg(chain.fgMultiplier), false);
+    if (clearedFixedTarget) {
+        impl_->prefs[QStringLiteral("fgFixedTarget")] = false;
+        if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", "fixed-target mode not saved");
+    }
     emit settingsChanged();
     emitChainChanged();
 }
@@ -321,10 +329,24 @@ engine::FixedTargetConfig normalizedFixedTarget(engine::FixedTargetConfig c) {
     return c;
 }
 }
+// 补帧模式: 0 = 倍率, 1 = 固定目标帧率. The two are exclusive by design - in fixed
+// target mode there is no user multiplier to pick, because the number of generated
+// frames comes from the interval itself. fgFixedTarget stays as the engine-side
+// switch so the settings struct and its persistence keep working unchanged.
+int QmlPlayerBridge::fgMode() const { return settings().fgFixedTarget.enabled ? 1 : 0; }
+void QmlPlayerBridge::setFgMode(int value) {
+    if (value != 0 && value != 1) return;
+    auto next = settings().fgFixedTarget;
+    if (next.enabled == (value == 1)) return;
+    next.enabled = value == 1;
+    commitFixedTarget(next, "mode");
+}
 bool QmlPlayerBridge::fgFixedTarget() const { return settings().fgFixedTarget.enabled; }
 bool QmlPlayerBridge::fgFixedTargetAvailable() const {
-    const auto s = settings();
-    return s.multiplier > 1 && s.frameGenerationBackend == engine::FrameGenerationBackend::Vfg;
+    // Only the backend matters: the multiplier is 1 whenever frame generation is
+    // off, and requiring > 1 hid this control exactly when it was needed (you pick
+    // the mode first, the group size follows).
+    return settings().frameGenerationBackend == engine::FrameGenerationBackend::Vfg;
 }
 int QmlPlayerBridge::fgFixedTargetFps() const { return int(std::lround(settings().fgFixedTarget.targetFps)); }
 double QmlPlayerBridge::fgFixedTargetSmoothing() const { return settings().fgFixedTarget.smoothing; }
@@ -348,11 +370,9 @@ void QmlPlayerBridge::commitFixedTarget(engine::FixedTargetConfig next, const ch
     emit settingsChanged();
 }
 void QmlPlayerBridge::setFgFixedTarget(bool value) {
-    // Turning the mode on while the picture already runs at the target rate is
-    // allowed: the scheduler bypasses such pairs on its own (sourceAtTarget).
-    auto next = settings().fgFixedTarget;
-    next.enabled = value;
-    commitFixedTarget(next, "mode");
+    // Kept for the engine preference path and older bindings; the panel now drives
+    // the mode through fgMode so the multiplier control can disappear with it.
+    setFgMode(value ? 1 : 0);
 }
 void QmlPlayerBridge::setFgFixedTargetFps(int value) {
     auto next = settings().fgFixedTarget;

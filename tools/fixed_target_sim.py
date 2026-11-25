@@ -2,18 +2,24 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Fixed-target frame generation: offline check of the scheduling maths.
 
-A literal port of include/veyra/engine/FixedTargetSchedule.h, plus a multiplier
-mode for comparison, so the cadence claim can be checked without a GPU, a
-capture card or a Veyra build. Run it after changing the header:
+A literal port of include/veyra/engine/FixedTargetSchedule.h, plus a plain
+multiplier mode for comparison, so the cadence claim can be checked without a
+GPU, a capture card or a Veyra build. Run it after changing the header:
 
     python tools/fixed_target_sim.py
 
-Exit code 0 means every published interval in every scenario was exactly one
-output period and every scenario matched its expected tick counts.
+The model is the adaptive one: each real interval asks for its own length worth
+of output frames at the target rate, the rounding remainder (carry) goes to the
+next pair, and VFG then generates count in-between frames at i/(count+1).
+
+Exit code 0 means every scenario's long-run output rate matched its target and
+the safety rules (cap, stall, source already at target) held everywhere in the
+swept matrix.
 """
 from __future__ import annotations
 
 import itertools
+import math
 import sys
 
 UNIT = 10_000_000  # 100 ns per second
@@ -28,10 +34,14 @@ def to_ms(v: int) -> float:
     return v / 10000.0
 
 
+def llround(x: float) -> int:
+    """std::llround: half away from zero, unlike Python's banker's rounding."""
+    return math.floor(x + 0.5) if x >= 0 else math.ceil(x - 0.5)
+
+
 class Config:
     def __init__(self, target_fps=80.0, max_runs=4, smoothing=0.0,
-                 clamp_min_ms=25.0, clamp_max_ms=60.0, max_interval_ms=100.0,
-                 near_start=0.05):
+                 clamp_min_ms=25.0, clamp_max_ms=60.0, max_interval_ms=100.0):
         self.enabled = True
         self.target_fps = target_fps
         self.max_runs = max_runs
@@ -39,14 +49,13 @@ class Config:
         self.clamp_min_ms = clamp_min_ms
         self.clamp_max_ms = clamp_max_ms
         self.max_interval_ms = max_interval_ms
-        self.near_start = near_start
 
 
 class Plan:
     def __init__(self):
+        self.count = 0
+        self.multiplier = 2
         self.t: list[float] = []
-        self.pts: list[int] = []
-        self.real = 0
         self.bypass = False
         self.reason = "off"
 
@@ -64,278 +73,217 @@ def capacity(cfg: Config, requested: int) -> int:
 
 
 def runs_for(target_fps: float) -> int:
-    """Port of engine::fixedTargetRunsFor: runs a target rate needs at 40 ms."""
-    if not (target_fps > 0.0):
+    """Port of engine::fixedTargetRunsFor: frames a target rate needs at 40 ms."""
+    if not (target_fps > 0.0) or not math.isfinite(target_fps):
         return 4
-    return min(max(int(-(-target_fps // 25.0)), 2), MAX_TICKS)
+    return max(2, min(MAX_TICKS, math.ceil(target_fps / 25.0)))
 
 
 class Scheduler:
-    """Port of engine::FixedTargetScheduler."""
-
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.phase = 0
-        self.phase_valid = False
+        self.carry = 0.0
         self.smoothed = 0.0
-        self.stats = {"intervals": 0, "ticks": 0, "dropped": 0,
-                      "long": 0, "at_target": 0, "invalid": 0, "off": 0, "resync": 0}
+        self.stats = {"intervals": 0, "generated": 0, "dropped": 0,
+                      "long": 0, "at_target": 0, "invalid": 0, "off": 0}
 
-    def plan(self, a: int, b: int, content_fps: float) -> Plan:
+    def plan(self, a: int, b: int, content_fps: float = 30.0) -> Plan:
         out = Plan()
-        out.real = b
-        span = b - a
-        if not (self.cfg.target_fps > 0.0):
-            self.stats["off"] += 1
-            out.bypass = True
-            out.reason = "targetOff"
-            self.phase_valid = False
+        c = self.cfg
+        if not c.enabled:
             return out
+        if not (c.target_fps > 0.0):
+            self.stats["off"] += 1
+            out.bypass, out.reason = True, "targetOff"
+            self.carry = 0.0
+            return out
+        span = b - a
         if span <= 0:
             self.stats["invalid"] += 1
-            out.bypass = True
-            out.reason = "interval"
-            self.phase_valid = False
+            out.bypass, out.reason = True, "interval"
+            self.carry = 0.0
             return out
         self.stats["intervals"] += 1
-        period = max(1, int(round(UNIT / self.cfg.target_fps)))
-        if span > int(self.cfg.max_interval_ms * 10000.0):
+        span_ms = to_ms(span)
+        if span_ms > c.max_interval_ms:
             self.stats["long"] += 1
-            self.stats["resync"] += 1
-            out.bypass = True
-            out.reason = "longInterval"
-            self.phase, self.phase_valid, self.smoothed = b, True, 0.0
+            out.bypass, out.reason = True, "longInterval"
+            self.carry = 0.0
+            self.smoothed = 0.0
             return out
-        if content_fps == content_fps and content_fps >= self.cfg.target_fps * 0.98:
+        if math.isfinite(content_fps) and content_fps >= c.target_fps * 0.98:
             self.stats["at_target"] += 1
-            out.bypass = True
-            out.reason = "sourceAtTarget"
-            self.phase, self.phase_valid, self.smoothed = b, True, 0.0
+            out.bypass, out.reason = True, "sourceAtTarget"
+            self.carry = 0.0
+            self.smoothed = 0.0
             return out
-        denom = span
-        if self.cfg.smoothing > 0.0:
-            lo = int(round(self.cfg.clamp_min_ms * 10000.0))
-            hi = int(round(self.cfg.clamp_max_ms * 10000.0))
-            clamped = min(max(span, min(lo, hi)), max(lo, hi))
-            if self.smoothed <= 0:
-                self.smoothed = float(clamped)
-            else:
-                self.smoothed += (clamped - self.smoothed) * min(max(self.cfg.smoothing, 0.0), 1.0)
-            denom = max(1, int(round(self.smoothed)))
-        if not self.phase_valid:
-            self.phase, self.phase_valid = a + period, True
-        if self.phase <= a:
-            self.phase += ((a - self.phase) // period + 1) * period
-        tick = self.phase
-        while tick < b:
-            t = (tick - a) / denom
-            self.phase = tick + period
-            if t <= self.cfg.near_start:
-                tick += period
-                continue
-            if len(out.t) >= self.cfg.max_runs or len(out.t) >= MAX_TICKS:
-                self.stats["dropped"] += 1
-                tick += period
-                continue
-            out.t.append(min(max(t, 0.001), 0.999))
-            out.pts.append(tick)
-            self.stats["ticks"] += 1
-            tick += period
-        # Every iteration advanced phase by exactly one period, so the loop left it
-        # on the first grid point at or after B. The real frame takes that point and
-        # the next pair starts one period later.
-        out.real = self.phase
-        self.phase += period
-        out.reason = "ticks" if out.t else "none"
+        used = span_ms
+        if c.smoothing > 0.0:
+            low, high = min(c.clamp_min_ms, c.clamp_max_ms), max(c.clamp_min_ms, c.clamp_max_ms)
+            clamped = max(low, min(high, span_ms))
+            self.smoothed = clamped if self.smoothed <= 0.0 else self.smoothed + (clamped - self.smoothed) * min(1.0, max(0.0, c.smoothing))
+            used = self.smoothed
+        want = used * c.target_fps / 1000.0 + self.carry
+        count = llround(want) - 1
+        count = max(0, count)
+        if count > c.max_runs:
+            self.stats["dropped"] += count - c.max_runs
+            count = c.max_runs
+            self.carry = 0.0
+        else:
+            self.carry = max(-1.0, min(1.0, want - (count + 1)))
+        out.count = count
+        out.multiplier = max(2, count + 1)
+        out.t = [(i + 1) / out.multiplier for i in range(count)]
+        out.reason = "adaptive" if count else "none"
+        self.stats["generated"] += count
         return out
 
 
-def simulate(cfg: Config, deltas_ms: list[float], start_ms=1000.0, content_fps=30.0):
-    """Every submitted PTS, in order, as the presentation timeline would see it."""
+def run(cfg: Config, spans_ms, content_fps=30.0, start_ms=1000.0):
     s = Scheduler(cfg)
-    submitted: list[int] = []
-    counts: list[int] = []
     a = ms(start_ms)
-    for d in deltas_ms:
+    plans, total = [], 0.0
+    for d in spans_ms:
         b = a + ms(d)
-        p = s.plan(a, b, content_fps)
-        submitted.extend(p.pts)
-        submitted.append(p.real)
-        counts.append(len(p.t))
+        plans.append(s.plan(a, b, content_fps))
         a = b
-    return submitted, counts, s.stats
+        total += d
+    return s, plans, total
 
 
-def multiplier_stream(deltas_ms: list[float], multiplier: int, start_ms=1000.0):
-    """The current behaviour, for comparison: t = i/M inside every interval."""
-    submitted: list[int] = []
-    a = ms(start_ms)
-    for d in deltas_ms:
-        b = a + ms(d)
-        for i in range(1, multiplier):
-            submitted.append(a + (b - a) * i // multiplier)
-        submitted.append(b)
-        a = b
-    return submitted
+def observed_fps(plans, total_ms: float) -> float:
+    frames = sum(p.count + (0 if p.bypass else 1) for p in plans)
+    return frames / (total_ms / 1000.0)
 
 
-def intervals(pts: list[int]) -> list[float]:
-    return [to_ms(pts[i] - pts[i - 1]) for i in range(1, len(pts))]
-
-
-def spread(values: list[float]) -> tuple[float, float, float]:
-    lo, hi = min(values), max(values)
-    return lo, hi, (hi - lo) / ((lo + hi) / 2.0) * 100.0
-
-
-def report(title: str, pts: list[int]) -> bool:
-    gaps = intervals(pts)
-    lo, hi, pct = spread(gaps)
-    ok = hi - lo <= 0.002  # 0.2 us of integer rounding, not a frame of drift
-    print(f"  {'PASS' if ok else 'FAIL'}  {title}: {len(pts)} frames, "
-          f"interval {lo:.3f}-{hi:.3f} ms (spread {pct:.2f}%)")
-    return ok
+def multiplier_mode(spans_ms, m: int = 2) -> float:
+    """Output rate a constant multiplier would have produced on the same cadence."""
+    return len(spans_ms) * m / (sum(spans_ms) / 1000.0)
 
 
 def main() -> int:
     fails = 0
-    print("Fixed-target scheduling, 80 FPS target")
 
-    steady = [1000.0 / 30.0] * 180
-    pts, counts, st = simulate(Config(80), steady)
-    fails += not report("steady 30 FPS", pts)
-    print(f"        generated per interval: {min(counts)}-{max(counts)} "
-          f"(mean {sum(counts) / len(counts):.3f}), dropped {st['dropped']}")
+    def check(ok: bool, label: str) -> None:
+        nonlocal fails
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+        fails += 0 if ok else 1
 
-    wobble = [40.0 if i % 3 == 0 else 1000.0 / 30.0 for i in range(180)]
-    pts, counts, st = simulate(Config(80), wobble)
-    fails += not report("30 <-> 25 FPS wobble", pts)
-    print(f"        generated per interval: {min(counts)}-{max(counts)}, "
-          f"source span {min(wobble):.2f}-{max(wobble):.2f} ms")
+    print("single scenarios (target 80 FPS, maxRuns 4)")
 
-    drift = [1000.0 / 30.0 + 1.7 * ((i * 7) % 5 - 2) for i in range(180)]
-    pts, _, _ = simulate(Config(80), drift)
-    fails += not report("30 FPS with +-3.4 ms transport jitter", pts)
+    # 30 FPS source: 33.33 ms at 80 FPS asks for 2.67 frames.
+    cfg = Config(80, 4)
+    spans = [1000.0 / 30.0] * 60
+    s, plans, total = run(cfg, spans)
+    fps = observed_fps(plans, total)
+    counts = sorted({p.count for p in plans})
+    check(math.isclose(fps, 80.0, abs_tol=0.5), f"30->80: {fps:.2f} FPS out (target 80)")
+    check(counts == [1, 2], f"30->80: generated frames per pair stay in {counts}")
+    uniform = all(abs(p.t[i] - (i + 1) / p.multiplier) < 1e-12
+                  for p in plans for i in range(p.count))
+    check(uniform, "30->80: positions are i/(count+1), VFG's own t = i/M")
+    check(s.stats["dropped"] == 0, "30->80: nothing dropped")
 
-    slow = [60.0] * 120
-    pts, counts, st = simulate(Config(120), slow, content_fps=20.0)
-    lo, hi = min(counts), max(counts)
-    ok = hi == 4 and st["dropped"] > 0
-    print(f"  {'PASS' if ok else 'FAIL'}  20 FPS -> 120 FPS: capped at maxRuns=4 "
-          f"(saw {lo}-{hi} runs, {st['dropped']} ticks dropped)")
-    fails += not ok
-    gaps = intervals(pts)
-    grid = ms(1000.0 / 120.0)
-    on_grid = all((p - pts[0]) % grid == 0 for p in pts)
-    print(f"  {'PASS' if on_grid else 'FAIL'}  dropped ticks keep every PTS on the 8.33 ms grid")
-    fails += not on_grid
+    # The wobble the mode exists for: 30 FPS content dipping to 25 FPS.
+    spans = [(40.0 if i % 2 else 1000.0 / 30.0) for i in range(60)]
+    s, plans, total = run(cfg, spans)
+    fps = observed_fps(plans, total)
+    forced = multiplier_mode(spans, 2)
+    check(math.isclose(fps, 80.0, abs_tol=0.6),
+          f"25/30 wobble: {fps:.2f} FPS out (target 80)")
+    check(abs(fps - 80.0) < abs(forced - 80.0),
+          f"25/30 wobble: closer to target than a constant 2X ({forced:.2f} FPS)")
+    long_counts = [p.count for i, p in enumerate(plans) if i % 2]
+    short_counts = [p.count for i, p in enumerate(plans) if not i % 2]
+    check(sum(long_counts) > sum(short_counts), "25/30 wobble: long intervals get the extra frame")
 
-    # A pause: 120 ms with no content, then normal service.
-    pts, counts, st = simulate(Config(80), steady[:40] + [120.0] + steady[:80])
-    gaps = intervals(pts)
-    stall = max(range(len(gaps)), key=lambda i: gaps[i])
-    after = gaps[stall + 1:]
-    ok = (st["long"] == 1 and st["resync"] == 1 and gaps[stall] > 100.0
-          and max(after) - min(after) <= 0.002)
-    print(f"  {'PASS' if ok else 'FAIL'}  120 ms stall: 1 bypass, 1 resync, "
-          f"cadence restored afterwards ({min(after):.3f}-{max(after):.3f} ms, "
-          f"stall gap {gaps[stall]:.3f} ms)")
-    fails += not ok
+    # 40 ms at 80 FPS is 3.2: the carried remainder has to show up as 2/2/3/2/2.
+    s, plans, _ = run(cfg, [40.0] * 5)
+    got = [p.count for p in plans]
+    check(sum(got) == 11, f"40 ms x5: generated {got} -> 16 output frames (80 FPS)")
 
-    # A real 60 FPS source at a 60 FPS target: nothing to insert.
-    pts, counts, st = simulate(Config(60), [1000.0 / 60.0] * 120, content_fps=60.0)
-    ok = st["at_target"] == len(counts) and sum(counts) == 0
-    print(f"  {'PASS' if ok else 'FAIL'}  60 FPS source at a 60 FPS target: every pair bypassed")
-    fails += not ok
+    # The cap drops frames and forgets the debt.
+    cfg160 = Config(160, runs_for(160))
+    s, plans, total = run(cfg160, [50.0] * 30, content_fps=20.0)
+    check(all(p.count <= cfg160.max_runs for p in plans), "20->160: no pair exceeds maxRuns")
+    check(s.stats["dropped"] > 0, f"20->160: {s.stats['dropped']} frames dropped (expected)")
+    check(abs(s.carry) < 1e-12, "20->160: the cap leaves no debt behind")
 
-    # The real frame takes the first grid point at or after B: that is what keeps
-    # every submitted interval at one period, and it bounds the cost to < 1 period.
-    print("Real-frame grid snap")
-    s = Scheduler(Config(80))
-    period = ms(1000.0 / 80.0)
-    a, on_grid, worst = ms(1000.0), True, 0
-    for i in range(240):
-        b = a + ms(40.0 if i % 4 == 0 else 1000.0 / 30.0)
-        p = s.plan(a, b, 30.0)
-        if p.real < b or p.real - b >= period:
-            on_grid = False
-        worst = max(worst, p.real - b)
-        a = b
-    print(f"  {'PASS' if on_grid else 'FAIL'}  the real frame lands on the first grid point at or after B")
-    fails += not on_grid
-    print(f"  {'PASS' if worst < period else 'FAIL'}  snap cost stays under one period (worst {to_ms(worst):.3f} ms)")
-    fails += 0 if worst < period else 1
+    # A stall is a bypass with the remainder forgotten.
+    s = Scheduler(Config(80, 4))
+    s.plan(ms(1000), ms(1000) + ms(33.34))
+    out = s.plan(ms(2000), ms(2120))
+    check(out.bypass and out.count == 0 and out.reason == "longInterval",
+          "120 ms gap: bypass, no frames, remainder cleared")
+    check(abs(s.carry) < 1e-12, "120 ms gap: no debt carried across the stall")
 
-    # Only the mode and the run cap shape the graph; the knobs are read per pair.
-    base, other = Config(80), Config(100)
-    other.smoothing, other.clamp_min_ms, other.clamp_max_ms = 0.5, 30.0, 70.0
-    knobs_ok = same_structure(base, other) and not same_structure(base, Config(80, max_runs=6))
-    print(f"  {'PASS' if knobs_ok else 'FAIL'}  rate/smoothing keep the graph, a new run cap rebuilds it")
-    fails += not knobs_ok
-    cap_ok = capacity(base, 2) == 5 and capacity(base, 8) == 8 and capacity(Config(80, 6), 2) == 7
-    print(f"  {'PASS' if cap_ok else 'FAIL'}  generated-slot capacity covers maxRuns + the real frame")
-    fails += not cap_ok
+    # Source already at the target.
+    s = Scheduler(Config(60, 4))
+    out = s.plan(ms(1000), ms(1016), content_fps=60.0)
+    check(out.bypass and out.reason == "sourceAtTarget", "60 FPS source at 60 target: auto bypass")
 
-    # The panel takes any integer 0-160 now, so the run cap follows what was typed
-    # and 0 means "insert nothing" instead of a division by zero.
-    print("Typed targets (0-160)")
-    runs_ok = (runs_for(80) == 4 and runs_for(120) == 5 and runs_for(144) == 6
-               and runs_for(160) == MAX_TICKS and runs_for(0) == 4)
-    print(f"  {'PASS' if runs_ok else 'FAIL'}  run cap follows the target: 80->{runs_for(80)} "
-          f"120->{runs_for(120)} 144->{runs_for(144)} 160->{runs_for(160)}")
-    fails += not runs_ok
-    off_pts, off_counts, off_st = simulate(Config(0), steady, content_fps=30.0)
-    off_ok = off_st["off"] == len(off_counts) and sum(off_counts) == 0
-    print(f"  {'PASS' if off_ok else 'FAIL'}  target 0 inserts nothing "
-          f"({off_st['off']} pairs bypassed)")
-    fails += not off_ok
-    for target, source in ((100, 30.0), (120, 30.0), (144, 30.0), (160, 30.0), (120, 25.0)):
+    # Zero target: the panel's "insert nothing".
+    s = Scheduler(Config(0, 4))
+    out = s.plan(ms(1000), ms(1040), content_fps=25.0)
+    check(out.bypass and out.reason == "targetOff", "target 0: bypass, no division")
+
+    # Smoothing damps the reaction to one short interval.
+    spans = [40.0, 25.0, 25.0, 40.0]
+    _, a, _ = run(Config(80, 4), spans)
+    _, b, _ = run(Config(80, 4, smoothing=0.6, clamp_min_ms=30, clamp_max_ms=45), spans)
+    check(a[1].count < b[1].count, f"smoothing: {b[1].count} vs {a[1].count} frames after a 25 ms pair")
+
+    print("\nmatrix sweep (source 20-60 FPS x target 60-160 FPS, steady and 25% wobble)")
+    # Two kinds of case: the ones the cap can serve, where the average output rate
+    # has to land on the target, and the ones whose longest interval needs more than
+    # maxRuns + 1 frames. The second kind is a physical limit of the group width -
+    # VFG tops out at 8 frames per pair - and the scheduler answers it by dropping
+    # frames and forgetting the debt, never by owing them as latency.
+    worst_rate, worst_case, capped = 0.0, "", []
+    for source, target, pattern in itertools.product(
+            (20.0, 25.0, 30.0, 40.0, 50.0, 60.0),
+            (60.0, 72.0, 80.0, 100.0, 120.0, 144.0, 160.0),
+            ("steady", "wobble")):
+        if target <= source:
+            continue
+        base = 1000.0 / source
+        spans = ([base] * 120 if pattern == "steady"
+                 else [base * (1.0 + 0.25 * (1 if i % 2 else -1)) for i in range(120)])
         cfg = Config(target, runs_for(target))
-        pts, counts, st = simulate(cfg, [1000.0 / source] * 120, content_fps=source)
-        lo2, hi2, pct2 = spread(intervals(pts))
-        ok = st["dropped"] == 0 and pct2 < 1.0
-        print(f"  {'PASS' if ok else 'FAIL'}  {source:.0f} FPS -> {target} FPS at maxRuns={cfg.max_runs}: "
-              f"{min(counts)}-{max(counts)} runs, dropped {st['dropped']}, spread {pct2:.2f}%")
-        fails += not ok
-
-    # Comparison against the current multiplier mode on the wobbling source.
-    print("Multiplier mode on the same 30<->25 FPS source (for comparison)")
-    for m in (2, 3):
-        pts = multiplier_stream(wobble, m)
-        gaps = intervals(pts)
-        lo, hi, pct = spread(gaps)
-        print(f"        {m}X: interval {lo:.3f}-{hi:.3f} ms (spread {pct:.1f}%), "
-              f"effective {1000.0 / (sum(gaps) / len(gaps)):.1f} FPS")
-
-    # Sweep: no configuration may put a PTS off the grid, and the cadence holds
-    # wherever the per-interval cap does not have to drop ticks (dropping them is
-    # the deliberate backpressure case, and it leaves a hole by definition).
-    print("Sweep: target 60-144, source 20-60 FPS, maxRuns 1-6")
-    worst = 0.0
-    capped = 0
-    for target, source, runs in itertools.product(
-            (60, 72, 80, 90, 100, 120, 144), (20, 24, 25, 30, 33.3, 40, 48, 60), (1, 2, 3, 4, 5, 6)):
-        cfg = Config(target, runs)
-        deltas = [1000.0 / source] * 90
-        pts, _, st = simulate(cfg, deltas, content_fps=source)
-        gaps = intervals(pts)
-        if not gaps:
+        s, plans, total = run(cfg, spans, content_fps=source)
+        fps = observed_fps(plans, total)
+        label = f"{source:.0f}->{target:.0f} {pattern}"
+        over = fps > target * 1.02
+        if target * (max(spans) / 1000.0) > cfg.max_runs + 1 + 1e-9:
+            capped.append(f"{label} ({fps:.1f} FPS)")
+            if over:
+                check(False, f"{label}: {fps:.2f} FPS overshoots the target")
             continue
-        period = ms(1000.0 / target)
-        if any((p - pts[0]) % period != 0 for p in pts):
-            print(f"  FAIL  off-grid PTS at {target} FPS target / {source} FPS source / maxRuns={runs}")
-            fails += 1
-        if st["dropped"] or st["at_target"]:
-            capped += 1
-            continue
-        lo, hi = min(gaps), max(gaps)
-        worst = max(worst, hi - lo)
-    print(f"  {'PASS' if worst <= 0.002 else 'FAIL'}  worst interval deviation: {worst * 1000:.2f} us "
-          f"({capped} combinations excluded as capped or bypassed)")
-    fails += 0 if worst <= 0.002 else 1
+        err = abs(fps - target) / target
+        if err > worst_rate:
+            worst_rate, worst_case = err, f"{label} ({fps:.2f})"
+        ok = (err < 0.02 and not over
+              and all(p.count <= cfg.max_runs for p in plans)
+              and all(p.multiplier <= capacity(cfg, 2) for p in plans))
+        if not ok:
+            check(False, f"{label}: {fps:.2f} FPS ({err*100:.2f}% off)")
+    check(worst_rate < 0.02,
+          f"every case inside the cap lands within 2% of target (worst {worst_case}, {worst_rate*100:.2f}%)")
+    print(f"  note: {len(capped)} case(s) need more than maxRuns+1 frames per interval "
+          f"(VFG tops out at 8 per pair): {', '.join(capped[:4])}{' ...' if len(capped) > 4 else ''}")
 
-    print("OK" if not fails else f"FAILED ({fails})")
-    return 0 if not fails else 1
+    print("\ncapacity")
+    check(capacity(Config(80, 4), 2) == 5, "capacity covers maxRuns + the real frame")
+    check(capacity(Config(120, 5), 2) == 6, "120 FPS asks for one more slot")
+    check(capacity(Config(160, 6), 8) == 8, "a larger requested multiplier is kept")
+    check(capacity(Config(80, 4), 2) <= 2 * (8 - 1), "capacity fits the generated pool (FrameBatch=8)")
+
+    if fails == 0:
+        print("\nall fixed-target simulations passed")
+    else:
+        print(f"\n{fails} fixed-target simulation(s) failed")
+    return 0 if fails == 0 else 1
 
 
 if __name__ == "__main__":

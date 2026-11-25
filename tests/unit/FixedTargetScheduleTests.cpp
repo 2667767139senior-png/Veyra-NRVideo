@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Fixed-target frame generation (engine/FixedTargetSchedule.h): the output grid,
-// the per-interval tick count, the cap and the bypass rules.
+// Fixed-target frame generation (engine/FixedTargetSchedule.h): the adaptive
+// per-interval frame count, the carried remainder, the cap and the bypass rules.
 //
-// tools/fixed_target_sim.py runs the same cases over the whole 60-144 FPS x
-// 20-60 FPS x maxRuns 1-6 matrix; keep the two in step.
+// tools/fixed_target_sim.py runs the same cases over a wider matrix (target
+// 60-160 FPS x source 20-60 FPS x maxRuns 2-6); keep the two in step.
 #include "veyra/engine/FixedTargetSchedule.h"
 #include <algorithm>
 #include <cstdint>
@@ -27,153 +27,168 @@ static FixedTargetConfig config(double target, unsigned maxRuns = 4) {
     return c;
 }
 
-// Feeds a source cadence and returns every submitted PTS in order, exactly as the
-// presentation timeline sees them: the generated ticks, then the real frame.
-static std::vector<int64_t> run(FixedTargetScheduler& s, const std::vector<int64_t>& deltas,
-                                int64_t start = ms(1000), double contentFps = 30.0,
-                                std::vector<unsigned>* counts = nullptr) {
-    std::vector<int64_t> out;
+// Feeds a source cadence and returns every plan, exactly as the engine sees them
+// one pair at a time. Counts are the generated frames of each pair; the group VFG
+// runs with is count + 1 because the real frame closes it.
+static std::vector<FixedTargetPlan> run(FixedTargetScheduler& s, const std::vector<double>& spansMs,
+                                        int64_t start = ms(1000), double contentFps = 30.0) {
+    std::vector<FixedTargetPlan> out;
     int64_t a = start;
-    for (auto d : deltas) {
-        const int64_t b = a + d;
-        const auto plan = s.plan(a, b, contentFps);
-        for (unsigned i = 0; i < plan.count; ++i) out.push_back(plan.pts100ns[i]);
-        out.push_back(plan.realPts100ns);
-        if (counts) counts->push_back(plan.count);
+    for (double d : spansMs) {
+        const int64_t b = a + ms(d);
+        out.push_back(s.plan(a, b, contentFps));
         a = b;
     }
     return out;
 }
 
-static bool uniform(const std::vector<int64_t>& pts, int64_t period) {
-    for (size_t i = 1; i < pts.size(); ++i)
-        if (pts[i] - pts[i - 1] != period) return false;
-    return pts.size() > 3;
-}
-
-static bool strictly_rising(const std::vector<int64_t>& pts) {
-    for (size_t i = 1; i < pts.size(); ++i)
-        if (pts[i] <= pts[i - 1]) return false;
-    return pts.size() > 1;
+// Output frames a cadence actually produced, over the wall time it covered: the
+// number the user reads off a frame counter (real frames included).
+static double observedFps(const std::vector<FixedTargetPlan>& plans, double totalMs) {
+    double frames = 0;
+    for (const auto& p : plans) frames += double(p.count) + (p.bypass ? 0.0 : 1.0);
+    return frames / (totalMs / 1000.0);
 }
 
 int main() {
-    // A steady 30 FPS source at 80 FPS: the count varies, the output does not.
+    // Off by default: the caller sees the pair exactly as it came in.
+    {
+        FixedTargetScheduler s;
+        const auto plan = s.plan(ms(1000), ms(1033), 30.0);
+        check(!plan.bypass && plan.count == 0 && plan.outputMultiplier == 2,
+              "disabled: no frames, and a group width that interpolates at 0.5");
+        check(std::string(plan.reason) == "off", "disabled: reason=off");
+    }
+
+    // 30 FPS -> 80 FPS: 33.33 ms asks for 2.67 frames, so the group walks 3,2,3,2
+    // and the long-run output rate is the target, not the source times a constant.
     {
         FixedTargetScheduler s;
         s.configure(config(80));
-        std::vector<unsigned> counts;
-        const auto pts = run(s, std::vector<int64_t>(120, ms(1000.0 / 30.0)), ms(1000), 30.0, &counts);
-        check(uniform(pts, ms(1000.0 / 80.0)), "30 FPS -> 80 FPS: every submitted interval is one 80 FPS period");
-        unsigned lo = 99, hi = 0;
-        for (auto c : counts) { lo = std::min(lo, c); hi = std::max(hi, c); }
-        check(lo == 1 && hi == 2, "30 FPS -> 80 FPS: 1 or 2 generated frames per interval");
-        check(s.stats().droppedByCap == 0, "30 FPS -> 80 FPS: nothing dropped at maxRuns=4");
+        std::vector<double> spans(60, 1000.0 / 30.0);
+        const auto plans = run(s, spans);
+        bool countSane = true, uniform = true, monotonicT = true;
+        for (const auto& p : plans) {
+            if (p.count < 1 || p.count > 3) countSane = false;
+            for (unsigned i = 0; i < p.count; ++i) {
+                const double want = double(i + 1) / double(p.count + 1);
+                if (std::abs(p.t[i] - want) > 1e-9) uniform = false;
+                if (!(p.t[i] > 0.0 && p.t[i] < 1.0)) monotonicT = false;
+                if (i && !(p.t[i] > p.t[i - 1])) monotonicT = false;
+            }
+        }
+        check(countSane, "30->80: 1-3 generated frames per pair");
+        check(uniform, "30->80: positions are i/(count+1), i.e. VFG's own t=i/M");
+        check(monotonicT, "30->80: every t inside (0,1) and rising");
+        const double fps = observedFps(plans, 60 * 1000.0 / 30.0);
+        check(std::abs(fps - 80.0) < 0.5, "30->80: average output rate is the target");
+        check(s.stats().droppedByCap == 0, "30->80: nothing dropped");
     }
 
-    // The point of the feature: a source that alternates 33/40 ms keeps the same
-    // output cadence, where a multiplier swings between 60 and 50 FPS.
+    // The wobble this mode exists for: 30 FPS dipping to 25 FPS. A constant
+    // multiplier drags the output down with it; the adaptive count does not.
     {
         FixedTargetScheduler s;
         s.configure(config(80));
-        std::vector<int64_t> deltas;
-        for (int i = 0; i < 200; ++i) deltas.push_back(ms(i % 3 == 0 ? 40.0 : 1000.0 / 30.0));
-        const auto pts = run(s, deltas);
-        check(uniform(pts, ms(1000.0 / 80.0)), "30<->25 FPS wobble: the output interval never moves");
+        std::vector<double> spans;
+        double totalMs = 0;
+        for (int i = 0; i < 40; ++i) {
+            const double d = (i % 2) ? 40.0 : 1000.0 / 30.0;   // 25 FPS / 30 FPS
+            spans.push_back(d); totalMs += d;
+        }
+        const auto plans = run(s, spans);
+        const double fps = observedFps(plans, totalMs);
+        check(std::abs(fps - 80.0) < 0.6, "25/30 wobble at 80: the rate stays on target");
+        unsigned long long shortSum = 0, longSum = 0;
+        for (size_t i = 0; i < plans.size(); ++i) ((i % 2) ? longSum : shortSum) += plans[i].count + 1;
+        check(longSum > shortSum, "25/30 wobble: the longer intervals really do get more frames");
     }
 
-    // Transport jitter that the deduplicated content clock still carries.
+    // 40 ms at 80 FPS is 3.2 frames: two generated, 0.2 carried. The carried
+    // remainder is what makes the average exact instead of 3.0.
     {
         FixedTargetScheduler s;
         s.configure(config(80));
-        std::vector<int64_t> deltas;
-        for (int i = 0; i < 180; ++i) deltas.push_back(ms(1000.0 / 30.0 + 1.7 * ((i * 7) % 5 - 2)));
-        check(uniform(run(s, deltas), ms(1000.0 / 80.0)), "+-3.4 ms pair jitter: the output interval never moves");
+        const auto plans = run(s, std::vector<double>(5, 40.0));
+        const unsigned sum = plans[0].count + plans[1].count + plans[2].count + plans[3].count + plans[4].count;
+        check(sum == 11, "40 ms pairs: 2/2/3/2/2 generated -> 16 output frames over 200 ms");
+        check(s.stats().lastCarry > -1.0 && s.stats().lastCarry < 1.0, "the carried remainder stays under one frame");
     }
 
-    // 20 FPS at 120 FPS would need six runs; maxRuns=4 drops the surplus but the
-    // clock keeps running and every PTS stays on the grid.
+    // Cap: 20 FPS content at 160 FPS wants 8 frames; the cap must drop frames and
+    // forget the debt, never owe them back as latency.
     {
         FixedTargetScheduler s;
-        s.configure(config(120));
-        std::vector<unsigned> counts;
-        const auto pts = run(s, std::vector<int64_t>(60, ms(50.0)), ms(1000), 20.0, &counts);
-        unsigned hi = 0;
-        for (auto c : counts) hi = std::max(hi, c);
-        check(hi == 4, "20 FPS -> 120 FPS: capped at maxRuns=4");
-        check(s.stats().droppedByCap > 0, "20 FPS -> 120 FPS: the surplus ticks are counted as dropped");
-        check(strictly_rising(pts), "dropped ticks never reorder the submitted stream");
-        const auto period = ms(1000.0 / 120.0);
-        bool onGrid = strictly_rising(pts);
-        for (size_t i = 1; i < pts.size(); ++i)
-            if ((pts[i] - pts[0]) % period != 0) onGrid = false;
-        check(onGrid, "every submitted PTS stays on the output grid after drops");
+        s.configure(config(160, 6));
+        const auto plans = run(s, std::vector<double>(20, 50.0), ms(1000), 20.0);
+        bool capped = true;
+        for (const auto& p : plans) if (p.count > 6) capped = false;
+        check(capped, "20->160: no pair exceeds maxRuns");
+        check(s.stats().droppedByCap > 0, "20->160: the overflow is counted as dropped");
+        check(std::abs(s.stats().lastCarry) < 1e-9, "the cap leaves no debt behind");
+        check(plans.back().count == 6, "the pairs after a capped one ask for the same, not for more");
     }
 
-    // A 120 ms stall is a pause, not content: no runs, the real frame is
-    // submitted as it arrives and the grid restarts from it.
+    // A stall: no interpolation across it, and the remainder is forgotten.
     {
         FixedTargetScheduler s;
         s.configure(config(80));
-        run(s, std::vector<int64_t>(20, ms(1000.0 / 30.0)), ms(1000));
-        const auto plan = s.plan(ms(2000), ms(2120), 30.0);
-        check(plan.bypass && plan.count == 0, "120 ms gap: bypass, no interpolation");
-        check(plan.realPts100ns == ms(2120), "120 ms gap: the real frame keeps its own PTS");
-        check(s.stats().bypassLong == 1 && s.stats().resyncs == 1, "120 ms gap: counted and re-synchronised");
-        const int64_t b = ms(2153.333);
-        const auto after = s.plan(ms(2120), b, 30.0);
-        check(after.count >= 1 && !after.bypass, "after a stall the grid runs again at once");
-        // The snap is measured against B, not against the stall: the real frame is
-        // never pushed past the first grid point at or after itself.
-        check((after.realPts100ns - b) <= ms(1000.0 / 80.0), "the first real frame after a stall is snapped within one period");
+        run(s, std::vector<double>(3, 1000.0 / 30.0));
+        const auto stall = s.plan(ms(2000), ms(2000) + ms(120), 30.0);
+        check(stall.bypass && stall.count == 0, "120 ms gap: bypassed, no frames generated");
+        check(std::string(stall.reason) == "longInterval", "120 ms gap: reason=longInterval");
+        const auto after = s.plan(ms(2000) + ms(120), ms(2000) + ms(120) + ms(1000.0 / 30.0), 30.0);
+        check(!after.bypass && after.count >= 1 && after.count <= 3, "after a stall the next normal pair plans normally");
     }
 
-    // A real 60 FPS source (menus) at a 60 FPS target has nothing to insert.
+    // Source already at or above the target (menus, a real 60 FPS source).
     {
         FixedTargetScheduler s;
         s.configure(config(60));
-        const auto plan = s.plan(ms(1000), ms(1016.667), 60.0);
-        check(plan.bypass && plan.count == 0, "60 FPS source at a 60 FPS target: automatic bypass");
-        check(s.stats().bypassAtTarget == 1, "the bypass is counted");
+        const auto plan = s.plan(ms(1000), ms(1016), 60.0);
+        check(plan.bypass && plan.count == 0, "60 FPS source at a 60 FPS target: auto bypass");
+        check(std::string(plan.reason) == "sourceAtTarget", "auto bypass reports sourceAtTarget");
+        check(s.stats().bypassAtTarget == 1, "auto bypass is counted");
     }
 
-    // t never reaches 0 or 1, always rises, and the real frame always follows the
-    // last tick - FrameBatch appends the real frame last and needs a rising PTS.
+    // 0 is the panel's "insert nothing", not an error and not a division.
     {
         FixedTargetScheduler s;
-        s.configure(config(120, kFixedTargetMaxTicks));
-        bool sane = true;
-        for (double span : {8.4, 12.5, 16.667, 20.0, 25.0, 33.333, 40.0, 50.0, 66.0, 99.0}) {
-            const auto plan = s.plan(ms(500), ms(500 + span), 30.0);
-            if (plan.count + 1 > 1 + kFixedTargetMaxTicks) sane = false;
-            for (unsigned i = 0; i < plan.count; ++i)
-                if (!(plan.t[i] > 0.0 && plan.t[i] < 1.0)) sane = false;
-            for (unsigned i = 1; i < plan.count; ++i)
-                if (!(plan.t[i] > plan.t[i - 1])) sane = false;
-            const int64_t last = plan.count ? plan.pts100ns[plan.count - 1] : ms(500);
-            if (plan.realPts100ns <= last) sane = false;
-        }
-        check(sane, "t stays inside (0,1), rises, and the real frame follows the last tick");
+        s.configure(config(0));
+        const auto plan = s.plan(ms(1000), ms(1040), 25.0);
+        check(plan.bypass && plan.count == 0, "target 0: bypassed");
+        check(std::string(plan.reason) == "targetOff", "target 0: reason=targetOff");
     }
 
-    // With smoothing off the tick sits at its exact content position; with it on
-    // the span is clamped, so a 20 ms source is stretched against the 25 ms floor.
+    // Non-positive intervals come from a reset or a duplicate, never from a plan.
     {
-        FixedTargetConfig fast = config(80);
-        FixedTargetScheduler exact;
-        exact.configure(fast);
-        const auto a = exact.plan(ms(100), ms(120), 50.0);
-        fast.smoothing = 0.5;
-        FixedTargetScheduler smoothed;
-        smoothed.configure(fast);
-        const auto b = smoothed.plan(ms(100), ms(120), 50.0);
-        check(a.count == b.count, "smoothing does not change which ticks exist");
-        if (a.count && b.count)
-            check(b.t[0] < a.t[0], "smoothing stretches a short interval against the 25 ms floor");
+        FixedTargetScheduler s;
+        s.configure(config(80));
+        check(s.plan(ms(1000), ms(1000), 30.0).bypass, "zero-length interval: bypassed");
+        check(s.plan(ms(1000), ms(990), 30.0).bypass, "negative interval: bypassed");
     }
 
-    // Capacity: a fixed-target graph must be built with enough generated slots.
+    // Smoothing: with 0 the exact span decides; a clamped average damps the count.
     {
+        FixedTargetScheduler plain, smooth;
+        plain.configure(config(80));
+        auto c = config(80);
+        c.smoothing = 0.6;
+        c.clampMinMs = 30;
+        c.clampMaxMs = 45;
+        smooth.configure(c);
+        const std::vector<double> spans = {40.0, 25.0, 25.0, 40.0};
+        const auto a = run(plain, spans);
+        const auto b = run(smooth, spans);
+        check(a[1].count < b[1].count, "smoothing keeps the count from collapsing after one short interval");
+        check(smooth.stats().lastSmoothedSpanMs > 25.0, "the smoothed span stays inside the clamps");
+    }
+
+    // Structure, capacity and validation.
+    {
+        check(fixedTargetRunsFor(80) == 4, "runsFor(80) keeps the historical four");
+        check(fixedTargetRunsFor(120) == 5, "runsFor(120) covers 40 ms at 120 FPS");
+        check(fixedTargetRunsFor(160) == 6, "runsFor(160) is the ceiling");
         FixedTargetConfig c = config(100, 4);
         check(fixedTargetCapacity(c, 2) == 5, "capacity covers maxRuns + the real frame");
         check(fixedTargetCapacity(c, 8) == 8, "a larger requested multiplier is kept");
@@ -181,89 +196,28 @@ int main() {
         check(fixedTargetCapacity(c, 2) == kFixedTargetMaxTicks + 1, "capacity follows maxRuns");
         FixedTargetConfig off;
         check(fixedTargetCapacity(off, 2) == 2, "multiplier mode keeps the requested multiplier");
+        check(fixedTargetSameStructure(config(80), config(144)), "the rate is not structural");
+        check(!fixedTargetSameStructure(config(80), config(80, 6)), "the cap is structural");
+
+        FixedTargetConfig v = config(80);
+        check(fixedTargetValid(v), "a normal config is valid");
+        v.targetFps = 0;
+        check(fixedTargetValid(v), "target 0 is valid (it means insert nothing)");
+        v = config(80); v.targetFps = 481;
+        check(!fixedTargetValid(v), "a target above 480 is rejected");
+        v = config(80); v.maxRuns = 0;
+        check(!fixedTargetValid(v), "maxRuns 0 is rejected");
+        v = config(80); v.smoothing = 1.5;
+        check(!fixedTargetValid(v), "smoothing outside 0..1 is rejected");
+        v = config(80); v.clampMaxMs = 10;
+        check(!fixedTargetValid(v), "a clamp ceiling below the floor is rejected");
+        v = config(80); v.maxIntervalMs = 30;
+        check(!fixedTargetValid(v), "maxIntervalMs below the clamp ceiling is rejected");
+        FixedTargetConfig disabled;
+        check(fixedTargetValid(disabled), "the disabled config is always valid");
     }
 
-    // The panel now takes any integer 0-160, so the run cap has to follow the
-    // typed rate: at 40 ms of content, 120 FPS needs five ticks and 144 needs six.
-    {
-        check(fixedTargetRunsFor(80.0) == 4, "80 FPS keeps the historical four runs");
-        check(fixedTargetRunsFor(60.0) == 3, "60 FPS needs three runs at 40 ms");
-        check(fixedTargetRunsFor(120.0) == 5, "120 FPS gets a fifth run so nothing is dropped");
-        check(fixedTargetRunsFor(144.0) == 6, "144 FPS reaches the batch ceiling");
-        check(fixedTargetRunsFor(160.0) == kFixedTargetMaxTicks, "160 FPS stays inside the ceiling");
-        check(fixedTargetRunsFor(0.0) == 4, "a zero target leaves the default alone");
-    }
-
-    // The real frame takes the first output grid point at or after B. That is what
-    // keeps every submitted interval at exactly one period, and it bounds the cost:
-    // the pair is never held longer than one output period.
-    {
-        FixedTargetScheduler s;
-        s.configure(config(80));
-        const int64_t period = ms(1000.0 / 80.0);
-        bool onGrid = true;
-        int64_t worstDelay = 0;
-        int64_t a = ms(1000);
-        for (int i = 0; i < 240; ++i) {
-            const int64_t b = a + ms(i % 4 == 0 ? 40.0 : 1000.0 / 30.0);
-            const auto plan = s.plan(a, b, 30.0);
-            if (plan.realPts100ns < b || plan.realPts100ns - b >= period) onGrid = false;
-            worstDelay = std::max(worstDelay, plan.realPts100ns - b);
-            a = b;
-        }
-        check(onGrid, "the real frame lands on the first grid point at or after B");
-        check(worstDelay < period, "snapping the real frame costs less than one output period");
-    }
-
-    // Only the mode and the run cap shape the graph; the rate and the smoothing
-    // knobs are read per pair (EnhancementSettings::sameVideoConfiguration).
-    {
-        const FixedTargetConfig a = config(80);
-        FixedTargetConfig b = a;
-        b.targetFps = 100; b.smoothing = 0.5; b.clampMinMs = 30; b.clampMaxMs = 70; b.maxIntervalMs = 150;
-        check(fixedTargetSameStructure(a, b), "rate and smoothing knobs keep the running graph");
-        b.maxRuns = 6;
-        check(!fixedTargetSameStructure(a, b), "a different run cap rebuilds the graph");
-        b = a; b.enabled = false;
-        check(!fixedTargetSameStructure(a, b), "turning the mode off rebuilds the graph");
-    }
-
-    // Validation.
-    {
-        // 0 is the panel's "insert nothing" value, so it has to be accepted and
-        // turned into a bypass rather than rejected or divided by.
-        FixedTargetConfig zero = config(0.0);
-        check(fixedTargetValid(zero), "a zero target is accepted as 'generate nothing'");
-        FixedTargetScheduler z;
-        z.configure(zero);
-        const auto zplan = z.plan(ms(100), ms(133), 30.0);
-        check(zplan.bypass && zplan.count == 0 && std::string(zplan.reason) == "targetOff",
-              "a zero target bypasses the pair instead of dividing by zero");
-        check(z.stats().bypassOff == 1, "the zero-target bypass is counted");
-        FixedTargetConfig c = config(80);
-        c.maxRuns = kFixedTargetMaxTicks + 1;
-        check(!fixedTargetValid(c), "maxRuns above the batch capacity is rejected");
-        c = config(80);
-        c.clampMinMs = 60;
-        c.clampMaxMs = 25;
-        check(!fixedTargetValid(c), "an inverted clamp range is rejected");
-        c = config(80);
-        c.maxIntervalMs = 40;
-        check(!fixedTargetValid(c), "a longest interval below the clamp is rejected");
-        c = config(80);
-        c.nearStart = 0.6;
-        check(!fixedTargetValid(c), "a start band past the middle is rejected");
-        check(fixedTargetValid(config(80)), "the default fixed-target configuration is valid");
-        check(fixedTargetValid(FixedTargetConfig{}), "a disabled configuration is valid");
-    }
-
-    // Disabled means no plan, never a changed stream.
-    {
-        FixedTargetScheduler s;
-        const auto plan = s.plan(ms(1000), ms(1033), 30.0);
-        check(!plan.bypass && plan.count == 0 && plan.realPts100ns == ms(1033), "disabled: the caller sees the plain pair");
-    }
-
-    std::printf("%s\n", failures ? "FAILED" : "OK");
-    return failures ? 1 : 0;
+    if (failures == 0) std::printf("all fixed-target schedule tests passed\n");
+    else std::printf("%d fixed-target schedule test(s) failed\n", failures);
+    return failures == 0 ? 0 : 1;
 }

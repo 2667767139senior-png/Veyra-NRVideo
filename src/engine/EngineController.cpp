@@ -3190,13 +3190,13 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         previewFgMultiplier=std::clamp(needed,2u,options.fgMultiplier);
                     }
                 }
-                // Fixed target (engine/FixedTargetSchedule.h): plan this pair on the output
-                // grid before anything reads previewFgMultiplier, because the graph, the
+                // Fixed target (engine/FixedTargetSchedule.h): decide this pair's frame
+                // count before anything reads previewFgMultiplier, because the graph, the
                 // admission budget and the capacity wait all take the per-pair group size
-                // from it. VFG only - it is the one backend with an explicit-timestep mode -
-                // and the plan carries the bypass cases (a stall, a source already at the
-                // target rate) as count=0, which makes the graph generate nothing for that
-                // pair instead of M-1 frames in the middle of it.
+                // from it. The count is adaptive - a long interval gets one more generated
+                // frame, a short one fewer - and the bypass cases (a stall, a source already
+                // at the target rate) come back as count=0, which makes the graph generate
+                // nothing for that pair instead of M-1 frames in the middle of it.
                 FixedTargetPlan fixedPlan;
                 const FixedTargetPlan* fixedPlanPtr=nullptr;
                 const bool fixedEligible=options.fg&&options.settings.fgFixedTarget.enabled&&
@@ -3204,15 +3204,13 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     !isImage&&!presentSinkFrameGeneration(options.settings.frameGenerationBackend);
                 // The mode, the rate and the smoothing knobs cannot be read from the
                 // settings revision: they are exempt from the rebuild comparison, so
-                // editing them mid-play does NOT bump it. Compare the struct instead;
-                // configure() re-anchors the grid only when the period actually
-                // changes, so an unrelated edit does not restart the output clock.
+                // editing them mid-play does NOT bump it. Compare the struct instead.
                 if(!(fixedTarget.config()==options.settings.fgFixedTarget))fixedTarget.configure(options.settings.fgFixedTarget);
                 if(fixedEligible){
                     if(std::isfinite(lastProcessedPtsMs)&&pts>lastProcessedPtsMs)
                         fixedPlan=fixedTarget.plan(int64_t(std::llround(lastProcessedPtsMs*10000.0)),
                                                    int64_t(std::llround(pts*10000.0)),pairContentFps);
-                    else{fixedPlan.realPts100ns=int64_t(std::llround(pts*10000.0));fixedPlan.bypass=true;fixedPlan.reason="firstPair";}
+                    else{fixedPlan.bypass=true;fixedPlan.reason="firstPair";}
                     previewFgMultiplier=std::max(2u,fixedPlan.count+1);
                     fixedPlanPtr=&fixedPlan;
                 }
@@ -3467,10 +3465,10 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 if(processed&&fixedPlanPtr&&host100ns()>=nextFixedTargetLog){
                     nextFixedTargetLog=host100ns()+10000000;
                     const auto& st=fixedTarget.stats();
-                    veyra::log::info("fixed-target",std::format("revision={} targetFps={:.2f} contentFps={:.2f} sourceMs={:.3f} smoothedMs={:.3f} ticks={} realGridDelayMs={:.3f} bypass={} reason={} intervals={} ticksTotal={} dropped={} bypassLong={} bypassAtTarget={} bypassOff={} resyncs={} (output clock 1/targetFps on the content clock; ticks = generated frames inside this pair, realGridDelayMs = how far B moved onto the grid, bypass = the pair ran as-is)",
+                    veyra::log::info("fixed-target",std::format("revision={} targetFps={:.2f} contentFps={:.2f} sourceMs={:.3f} smoothedMs={:.3f} frames={} multiplier={} carry={:.2f} bypass={} reason={} intervals={} generated={} dropped={} bypassLong={} bypassAtTarget={} bypassOff={} (frames = generated frames for this pair, multiplier = frames+1 = the VFG group width, carry = fractional frame handed to the next pair; the real frame is never moved)",
                         options.settings.revision,options.settings.fgFixedTarget.targetFps,pairContentFps,st.lastSpanMs,st.lastSmoothedSpanMs,
-                        fixedPlanPtr->count,double(fixedPlanPtr->realPts100ns-int64_t(std::llround(pts*10000.0)))/10000.0,
-                        fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.ticks,st.droppedByCap,st.bypassLong,st.bypassAtTarget,st.bypassOff,st.resyncs));
+                        fixedPlanPtr->count,fixedPlanPtr->outputMultiplier,st.lastCarry,
+                        fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.ticks,st.droppedByCap,st.bypassLong,st.bypassAtTarget,st.bypassOff));
                 }
                 if(!processed){
                     const auto failedComponent=graph->failedBackend();

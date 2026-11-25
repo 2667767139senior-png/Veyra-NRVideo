@@ -289,9 +289,9 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             const bool on = p.value(QStringLiteral("hudLock")).toBool();
             if (s.hudLock != on) { s.hudLock = on; changed = true; }
         }
-        // 固定目标帧率 (engine/FixedTargetSchedule.h). The mode is only meaningful for
-        // live VFG, so it is restored as a stored preference either way and the panel
-        // greys it when the backend or the multiplier does not qualify.
+        // 固定目标帧率 (engine/FixedTargetSchedule.h). The mode only exists on VFG, so
+        // the stored value is kept but not applied to another backend: the panel shows
+        // the mode row greyed with the reason instead of a mode that does nothing.
         {
             engine::FixedTargetConfig fixed = s.fgFixedTarget;
             if (p.contains(QStringLiteral("fgFixedTarget"))) fixed.enabled = p.value(QStringLiteral("fgFixedTarget")).toBool();
@@ -302,6 +302,9 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             // The run cap is derived, not stored: a profile from before the panel
             // took arbitrary rates still has the historical four.
             fixed.maxRuns = engine::fixedTargetRunsFor(fixed.targetFps);
+            // Only VFG can run it. A profile restored together with another backend
+            // would otherwise come back with the mode selected and greyed out.
+            if (fixed.enabled && s.frameGenerationBackend != engine::FrameGenerationBackend::Vfg) fixed.enabled = false;
             // A profile written by an older build (or hand-edited) must not reach the
             // scheduler outside its accepted ranges; keep the defaults otherwise.
             if (engine::fixedTargetValid(fixed) && !(s.fgFixedTarget == fixed)) { s.fgFixedTarget = fixed; changed = true; }

@@ -40,7 +40,11 @@ public:
     // timestep > 0 selects VFG's explicit-timestep mode for THIS run: the effect
     // is switched to FrameMultiplier=0 (which resets the selector) and Timestep is
     // set before the run. subframe then only addresses the output buffer, so the
-    // caller keeps it inside 1..multiplier-1. 0 keeps multiplier mode.
+    // caller keeps it inside 1..multiplier-1. 0 keeps multiplier mode, which is
+    // what the shipped fixed-target mode uses: it varies the GROUP WIDTH per pair
+    // (engine/FixedTargetSchedule.h) and leaves the positions at i/M, so the plain
+    // FrameIndex path already puts every frame where it belongs. The timestep path
+    // is kept for experiments only; nothing in the pipeline passes a non-zero value.
     // primary: -1 picks the effect the way multiplier mode does, 1 forces the
     // chosen model and 0 the faster one (mixed tiers, fastReady()).
     bool generate(unsigned parity,unsigned subframe,unsigned multiplier,bool reset,bool fast=false,

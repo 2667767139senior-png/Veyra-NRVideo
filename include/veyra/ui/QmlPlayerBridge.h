@@ -478,16 +478,21 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(bool pacingRepair READ pacingRepair WRITE setPacingRepair NOTIFY settingsChanged)
     Q_PROPERTY(bool hudLock READ hudLock WRITE setHudLock NOTIFY settingsChanged)
     Q_PROPERTY(int hudProtect READ hudProtect WRITE setHudProtect NOTIFY settingsChanged)
-    // 固定目标帧率 (engine/FixedTargetSchedule.h): VFG only. The output runs on a
-    // free-running grid instead of i/M inside every pair. Shell preferences, like
-    // the controls above: the mode and the run cap rebuild the graph, while the
-    // rate and the smoothing knobs are read per pair.
+    // 补帧模式 (engine/FixedTargetSchedule.h): 0 = 倍率, 1 = 固定目标帧率. The two are
+    // mutually exclusive - the multiplier control disappears in fixed-target mode
+    // because the per-pair group size is decided from the interval, not by the user.
+    Q_PROPERTY(int fgMode READ fgMode WRITE setFgMode NOTIFY settingsChanged)
+    // 固定目标帧率: VFG only. Each pair generates as many frames as its own length
+    // asks for at the target rate (adaptive), instead of a constant M-1. Shell
+    // preferences, like the controls above: the mode and the run cap rebuild the
+    // graph, while the rate and the smoothing knobs are read per pair.
     Q_PROPERTY(bool fgFixedTarget READ fgFixedTarget WRITE setFgFixedTarget NOTIFY settingsChanged)
     Q_PROPERTY(int fgFixedTargetFps READ fgFixedTargetFps WRITE setFgFixedTargetFps NOTIFY settingsChanged)
     Q_PROPERTY(double fgFixedTargetSmoothing READ fgFixedTargetSmoothing WRITE setFgFixedTargetSmoothing NOTIFY settingsChanged)
     Q_PROPERTY(int fgFixedTargetClampMinMs READ fgFixedTargetClampMinMs WRITE setFgFixedTargetClampMinMs NOTIFY settingsChanged)
     Q_PROPERTY(int fgFixedTargetClampMaxMs READ fgFixedTargetClampMaxMs WRITE setFgFixedTargetClampMaxMs NOTIFY settingsChanged)
-    // The mode needs live VFG with frame generation on; the panel greys it otherwise.
+    // True when the fixed-target mode can actually run (VFG backend). The mode row
+    // stays visible either way and explains itself when this is false.
     Q_PROPERTY(bool fgFixedTargetAvailable READ fgFixedTargetAvailable NOTIFY settingsChanged)
     Q_PROPERTY(bool dynamicHud READ dynamicHud WRITE setDynamicHud NOTIFY settingsChanged)
     Q_PROPERTY(bool dlssgLiteAvailable READ dlssgLiteAvailable CONSTANT)
@@ -1200,6 +1205,8 @@ public:
     void setHudLock(bool value);
     int hudProtect() const;
     void setHudProtect(int value);
+    int fgMode() const;
+    void setFgMode(int value);
     bool fgFixedTarget() const;
     void setFgFixedTarget(bool value);
     int fgFixedTargetFps() const;

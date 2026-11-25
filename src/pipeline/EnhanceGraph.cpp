@@ -4580,15 +4580,17 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     }
     previousSource_=sourceFrameId;
     const bool fgBackendAvailable=fgEnabled_&&fgCreated();
-    const unsigned fgMultiplier=previewMultiplier&&fgBackendAvailable?std::clamp(previewMultiplier,2u,desc_.fgMultiplier):desc_.fgMultiplier;
-    // Fixed-target (engine/FixedTargetSchedule.h): the caller planned this pair on
-    // the output grid, so fgCalls is the number of grid positions inside (A,B) -
-    // possibly zero - and every generated frame carries its grid timestamp. The
-    // plan is only ever supplied for the VFG backend, whose explicit-timestep mode
-    // takes an arbitrary t; every other backend keeps the multiplier path.
+    // Fixed target (engine/FixedTargetSchedule.h): the caller already decided how
+    // many frames THIS interval needs - more for a long one, fewer for a short one -
+    // so the mode boils down to a per-pair multiplier: count+1, because the real
+    // frame closes the group. Everything below is then the multiplier path that has
+    // always shipped (slots, t = i/M, HUD pick, timestamps). count = 0 gives M = 1
+    // and fgCalls = 0, i.e. "generate nothing for this pair".
     const bool fixedTarget=fixedPlan!=nullptr&&vfgBackend_!=nullptr&&fgBackendAvailable;
     const unsigned fixedTicks=fixedTarget?std::min<unsigned>(fixedPlan->count,vfgSlotCount()-1u):0u;
-    out.fgCandidates=fgBackendAvailable?(fixedTarget?fixedTicks:fgMultiplier-1):0;
+    const unsigned fgMultiplier=fixedTarget?(fixedTicks+1u):
+        (previewMultiplier&&fgBackendAvailable?std::clamp(previewMultiplier,2u,desc_.fgMultiplier):desc_.fgMultiplier);
+    out.fgCandidates=fgBackendAvailable?(fgMultiplier-1):0;
     bool resetFg=reset||!prevValid_||fgHistorySkipped_;
     const bool historyValid=!resetFg;
     // VEYRA_TEST_VFG_SKIP_RESETS_HISTORY=1 restores the pre-2026-10-10 rule
@@ -4612,8 +4614,11 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     out.fgFastForBudget=out.fgFast&&decision==FgDecision::FastForBudget;
     // A reset has no usable A/B pair. Seed one complete 2X evaluation group;
     // all later subframes would repeat reset work and cannot be presented.
-    const uint32_t fgCalls=(resetFg||reduced)?1:(fixedTarget?fixedTicks:fgMultiplier-1);
-    const unsigned outputMultiplier=reduced?2u:(fixedTarget?std::max(fgMultiplier,fixedTicks+1):fgMultiplier);
+    // M = 1 only happens on a fixed-target pair the scheduler bypassed; a reset
+    // there must still generate nothing, or it would ask VFG for FrameIndex 1 of a
+    // multiplier that has no in-between frame.
+    const uint32_t fgCalls=fgMultiplier<2?0u:((resetFg||reduced)?1:(fgMultiplier-1));
+    const unsigned outputMultiplier=reduced?2u:std::max(2u,fgMultiplier);
     if(runFg&&resetFg){
         if(reseedRejected)out.fgSkippedBeforeEval=out.fgCandidates-fgCalls;
         else out.fgSkippedForReset=out.fgCandidates-fgCalls;
@@ -4667,28 +4672,10 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     out.videoFenceObject = ring_->fence();
 
     // FG reads enhanced SDR color, not the pre-NR guidance input.
-    // Fixed-target helpers: t and the grid timestamp of subframe `sub`. A reset
-    // or a budget-reduced group runs one frame at the first planned tick, so its
-    // position and timestamp still belong to this pair's grid.
-    auto tickTimestep=[&](uint32_t sub)->double{
-        return fixedTarget&&sub>=1&&sub-1<fixedPlan->count?fixedPlan->t[sub-1]:0.5;};
-    auto tickPts=[&](uint32_t sub)->int64_t{
-        if(fixedTarget&&sub>=1&&sub-1<fixedPlan->count)return fixedPlan->pts100ns[sub-1];
-        return FrameBatch::interpolate(out.batch.a100ns,out.batch.b100ns,sub,outputMultiplier);};
-    // The mixed tier's chosen model goes to the tick nearest the middle of the
-    // interval, where interpolation is hardest (vfgPrimarySubframe, by t).
-    int fixedPrimary=0;
-    if(fixedTarget&&fixedTicks){
-        double best=2.0;
-        for(unsigned i=0;i<fixedTicks;++i){
-            const double distance=std::abs(fixedPlan->t[i]-0.5);
-            if(distance<best-1e-9){best=distance;fixedPrimary=int(i)+1;}
-        }
-    }
     if (runFg && fgCreated()) {
       for(uint32_t sub=1;sub<=fgCalls;++sub){
         const uint32_t generatedSlot=parity+(sub-1)*2;
-        const bool useNewerHud=!resetFg&&(fixedTarget?tickTimestep(sub)>0.5:sub*2>outputMultiplier);
+        const bool useNewerHud=!resetFg&&sub*2>outputMultiplier;
         if(amfFrc_){
             // GPU producer -> AMF FRC on its own queue -> GPU consumer, ordered by
             // AMF's texture fences (queue waits, no CPU wait). One frame per pair.
@@ -4747,15 +4734,11 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         if(vfgBackend_){
             // GPU producer -> CUDA interpolation -> GPU consumer. No per-frame
             // CPU fence waits/readback; the bounded command ring owns reuse.
-            // Fixed-target passes the tick's own t through VFG's explicit-timestep
-            // mode (FrameMultiplier=0), which is why sub only picks the output
-            // buffer there. A mixed tier's chosen model follows t instead of the
-            // subframe index; a single-model tier keeps the automatic choice so
-            // fastReady() can still repair an overloaded pair.
-            const int primaryHint=fixedTarget&&engine::vfgMixedQuality(desc_.vfgQuality)?
-                int(sub==uint32_t(fixedPrimary)):-1;
+            // The group width comes from fgMultiplier, which for fixed target is
+            // this pair's own frame count + 1, so VFG still runs its plain
+            // FrameMultiplier/FrameIndex selection at t = sub/M.
             if(!vfgBackend_->generate(parity,sub,resetFg?2u:outputMultiplier,resetFg,out.fgFast,
-                    fixedTarget?tickTimestep(sub):0.0,primaryHint)){failedBackend_=engine::FailedBackend::Fg;return false;}
+                    0.0,-1)){failedBackend_=engine::FailedBackend::Fg;return false;}
             auto* flist=ring_->acquireNext(slot,st);if(!flist)return false;
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COPY_DEST);
             if(!vfgBackend_->copyOutput(flist,genFrame_[generatedSlot].Get(),generatedSlot)){failedBackend_=engine::FailedBackend::Fg;return false;}
@@ -4772,11 +4755,11 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             if(previewCheckpoint&&!reset)previewCheckpoint();
             ++out.fgEvaluated;out.hasGenerated=!resetFg;out.genSlot=parity;
             out.genFenceValue=ring_->lastSignaledValue();out.genFenceObject=ring_->fence();
-            out.generatedPtsMs=fixedTarget?(prevPtsMs_+(ptsMs-prevPtsMs_)*tickTimestep(sub)):(prevPtsMs_+ptsMs)*0.5;
+            out.generatedPtsMs=prevPtsMs_+(ptsMs-prevPtsMs_)*double(sub)/double(outputMultiplier);
             if(out.hasGenerated){
                 ++metrics_.fgSubmittedCandidates;
                 BatchFrame f;f.identity=out.batch.identity;f.kind=FrameKind::Generated;f.validity=GenerationValidity::Pending;f.subframe=sub;
-                f.pts100ns=tickPts(sub);
+                f.pts100ns=FrameBatch::interpolate(out.batch.a100ns,out.batch.b100ns,sub,outputMultiplier);
                 f.lease=std::make_shared<FrameLease>();f.lease->texture=genFrame_[generatedSlot];f.lease->slot=generatedSlot;
                 f.lease->readyFence=out.genFenceValue;f.lease->readyFenceObject=out.genFenceObject;generatedLeases_[generatedSlot]=f.lease;out.batch.append(std::move(f));
             }
@@ -4881,11 +4864,9 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     ++realFrameIndex_;
     out.realFrameIndex = realFrameIndex_;
     out.videoSlot = parity;
-    // Fixed-target: the real frame is submitted on the output grid, one period
-    // after the last generated tick, so the panel never sees a gap that only
-    // exists because B arrived off-grid (engine/FixedTargetSchedule.h).
-    const int64_t realPts=fixedTarget?std::max(fixedPlan->realPts100ns,out.batch.b100ns):out.batch.b100ns;
-    BatchFrame real;real.identity=out.batch.identity;real.pts100ns=realPts;real.lease=std::make_shared<FrameLease>();real.lease->texture=exclusionVideo_[parity]?exclusionVideo_[parity]:videoFrame_[parity];real.lease->sourceReference=sourceReferences_[parity];real.lease->baseReference=baseReferences_[parity];real.lease->slot=parity;real.lease->readyFence=out.videoFenceValue;real.lease->readyFenceObject=out.videoFenceObject;real.lease->referencesValid=retainReferences;realLeases_[parity]=real.lease;out.batch.append(std::move(real));
+    // The real frame keeps its own timestamp in every mode. Fixed target only
+    // changes how many frames were generated before it, never when B is shown.
+    BatchFrame real;real.identity=out.batch.identity;real.pts100ns=out.batch.b100ns;real.lease=std::make_shared<FrameLease>();real.lease->texture=exclusionVideo_[parity]?exclusionVideo_[parity]:videoFrame_[parity];real.lease->sourceReference=sourceReferences_[parity];real.lease->baseReference=baseReferences_[parity];real.lease->slot=parity;real.lease->readyFence=out.videoFenceValue;real.lease->readyFenceObject=out.videoFenceObject;real.lease->referencesValid=retainReferences;realLeases_[parity]=real.lease;out.batch.append(std::move(real));
     if(veyra::log::verboseFrameLogs())veyra::log::info("frame-batch",std::format("batch={} epoch={} revision={} source={} a={} b={} count={} realSlot={} realFence={} genSlot={} genFence={}",out.batch.batchId,epoch_,out.batch.identity.settingsRevision,out.batch.identity.sourceFrameId,out.batch.a100ns,out.batch.b100ns,out.batch.count,parity,out.videoFenceValue,out.genSlot,out.genFenceValue));
     if(pausedEligible&&lastAppliedSettings_){
         pausedNrCacheValid_=true;pausedNrFrame_=frame;pausedNrSourceId_=sourceFrameId;pausedNrPts_=ptsMs;

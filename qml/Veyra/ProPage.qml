@@ -1909,7 +1909,9 @@ VPage {
                             hue: "#3DDC84"
                             title: qsTr("补帧")
                             summary: qsTr("始终在所有画质效果之后") + (veyra.fgEnabled
-                                     ? " · " + veyra.fgMultiplier + "X " + Support.fgBackendShortLabel(backendOption)
+                                     ? (veyra.fgMode === 1
+                                         ? " · " + qsTr("固定 %1 FPS").arg(veyra.fgFixedTargetFps) + " " + Support.fgBackendShortLabel(backendOption)
+                                         : " · " + veyra.fgMultiplier + "X " + Support.fgBackendShortLabel(backendOption))
                                      : qsTr(" · 已关闭"))
                             switchObjectName: "list-fg-enabled"
                             switchAvailable: Support.available(veyra, "frame-generation")
@@ -1937,7 +1939,27 @@ VPage {
                                 VSeg { objectName: "list-fg-motion"; options: [{id:"0",label:qsTr("零运动")},{id:"1",label:qsTr("光流")}]; current: String(veyra.fgMotionSource); onPicked: id => veyra.fgMotionSource = Number(id) }
                             }
                             VRow {
+                                objectName: "list-fg-mode"
+                                label: qsTr("补帧模式")
+                                // Always shown so the choice is discoverable; only VFG can
+                                // actually insert frames where they belong, so the other
+                                // backends get the row greyed with the reason.
+                                enabled: veyra.fgFixedTargetAvailable
+                                opacity: enabled ? 1 : 0.55
+                                hint: veyra.fgFixedTargetAvailable
+                                      ? qsTr("倍率：每个真实帧间隔固定生成 M-1 帧，游戏掉帧时输出帧率跟着掉 · 固定目标帧率：按本间隔的长度决定生成几帧（间隔长多生成、间隔短少生成），真实帧时间不变、不加延迟")
+                                      : qsTr("固定目标帧率需要补帧方式选 NVIDIA VFG")
+                                VSelect {
+                                    objectName: "list-fg-mode-select"
+                                    options: [{id:"0",label:qsTr("倍率")},{id:"1",label:qsTr("固定目标帧率")}]
+                                    value: veyra.fgMode === 1 ? qsTr("固定目标帧率") : qsTr("倍率")
+                                    onPicked: id => veyra.fgMode = Number(id)
+                                }
+                            }
+                            VRow {
                                 label: qsTr("倍率")
+                                // 固定目标模式下倍率是引擎逐对算出来的，没有可选项。
+                                visible: veyra.fgMode !== 1
                                 // 档位与作者原版一致（只有数字档）；自动选择由下方独立开关控制。
                                 hint: veyra.fgDisplayHint.length > 0 ? veyra.fgDisplayHint : veyra.fgMaxMultiplier + qsTr("X 为上限")
                                 hintColor: veyra.fgDisplayHint.length > 0 ? Theme.warn : Theme.t3
@@ -2014,7 +2036,7 @@ VPage {
                             VRow {
                                 objectName: "list-fg-adaptive"
                                 label: qsTr("自适应倍率")
-                                visible: veyra.fgMultiplier > 2 && (veyra.fgBackendName === "dlss" || veyra.fgBackendName === "anr" || veyra.fgBackendName === "vfg")
+                                visible: veyra.fgMode !== 1 && veyra.fgMultiplier > 2 && (veyra.fgBackendName === "dlss" || veyra.fgBackendName === "anr" || veyra.fgBackendName === "vfg")
                                 hint: qsTr("把所选倍率当上限，按游戏实时帧率逐对选用最接近目标帧率（输出上限或屏幕刷新率）的倍率，游戏掉帧时输出仍保持平稳；不重建补帧 · 默认关闭")
                                 VSwitch {
                                     objectName: "list-fg-adaptive-switch"
@@ -2023,21 +2045,10 @@ VPage {
                                 }
                             }
                             VRow {
-                                objectName: "list-fg-fixed-target"
-                                label: qsTr("固定目标帧率")
-                                visible: veyra.fgFixedTargetAvailable
-                                hint: qsTr("输出按固定节拍走：游戏从 30 掉到 25 帧时，这一对帧多生成一帧吸收波动，输出帧率不跟着掉。VFG 专属，开启后会重建补帧 · 默认关闭")
-                                VSwitch {
-                                    objectName: "list-fg-fixed-target-switch"
-                                    checked: veyra.fgFixedTarget
-                                    onToggled: checked => veyra.fgFixedTarget = checked
-                                }
-                            }
-                            VRow {
                                 objectName: "list-fg-fixed-target-rate"
                                 label: qsTr("目标帧率")
-                                visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget
-                                hint: qsTr("0～160 任意整数：点右侧数字直接输入，或拖滑块。要高于真实源帧率；源帧率已达到或超过它时自动旁路不插帧，填 0 就是完全不生成")
+                                visible: veyra.fgFixedTarget
+                                hint: qsTr("0～160 任意整数：点右侧数字直接输入，或拖滑块。每个真实帧间隔按自己的长度算生成几帧：40 ms 的间隔在 80 FPS 下要 3.2 帧，所以这一对生成 2 帧、下一对 3 帧，长期平均正好是目标值。要高于真实源帧率；源帧率已达到或超过它时自动旁路，填 0 就是完全不生成")
                                 value: veyra.fgFixedTargetFps + " FPS"
                                 VSlider {
                                     objectName: "list-fg-fixed-target-rate-slider"
@@ -2052,8 +2063,8 @@ VPage {
                             VRow {
                                 objectName: "list-fg-fixed-target-smoothing"
                                 label: qsTr("帧间隔平滑")
-                                visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget
-                                hint: qsTr("0 关闭：帧生成位置严格按真实帧间隔算，速度最准。大于 0 会按钳位范围做指数平滑，画面节奏更稳但位置略有偏差")
+                                visible: veyra.fgFixedTarget
+                                hint: qsTr("0 关闭（默认）：直接用这次的帧间隔算帧数，生成帧落在真实位置上。大于 0 会按钳位范围做指数平均，帧间隔抖动时生成帧数更稳，代价是帧数变化慢一两拍")
                                 value: veyra.fgFixedTargetSmoothing <= 0 ? qsTr("关闭") : Number(veyra.fgFixedTargetSmoothing).toFixed(2)
                                 VSlider {
                                     objectName: "list-fg-fixed-target-smoothing-slider"
@@ -2067,8 +2078,8 @@ VPage {
                             VRow {
                                 objectName: "list-fg-fixed-target-clamp-min"
                                 label: qsTr("帧间隔下限")
-                                visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget && veyra.fgFixedTargetSmoothing > 0
-                                hint: qsTr("平滑时把源帧间隔至少当成这么久（毫秒），避免真实帧率偏高时生成帧挤在区间开头")
+                                visible: veyra.fgFixedTarget && veyra.fgFixedTargetSmoothing > 0
+                                hint: qsTr("平滑时把源帧间隔至少当成这么久（毫秒），避免一次偏短的间隔把生成帧数压得过低")
                                 value: veyra.fgFixedTargetClampMinMs + " ms"
                                 VSlider {
                                     objectName: "list-fg-fixed-target-clamp-min-slider"
@@ -2081,8 +2092,8 @@ VPage {
                             VRow {
                                 objectName: "list-fg-fixed-target-clamp-max"
                                 label: qsTr("帧间隔上限")
-                                visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget && veyra.fgFixedTargetSmoothing > 0
-                                hint: qsTr("平滑时把源帧间隔最多当成这么久（毫秒）；超过 100 ms 的停顿不插帧，直接输出真实帧并重新对齐节拍")
+                                visible: veyra.fgFixedTarget && veyra.fgFixedTargetSmoothing > 0
+                                hint: qsTr("平滑时把源帧间隔最多当成这么久（毫秒）；超过 100 ms 的停顿不插帧，直接输出真实帧并清零累计余量")
                                 value: veyra.fgFixedTargetClampMaxMs + " ms"
                                 VSlider {
                                     objectName: "list-fg-fixed-target-clamp-max-slider"
