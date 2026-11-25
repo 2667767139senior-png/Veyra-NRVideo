@@ -308,6 +308,10 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             // A profile written by an older build (or hand-edited) must not reach the
             // scheduler outside its accepted ranges; keep the defaults otherwise.
             if (engine::fixedTargetValid(fixed) && !(s.fgFixedTarget == fixed)) { s.fgFixedTarget = fixed; changed = true; }
+            // Restoring the mode also restores "generation is on": with the mode
+            // selected the multiplier control is hidden, so a stored 1 would leave
+            // the engine's multiplier>1 gates closed and the mode silently dead.
+            if (s.fgFixedTarget.enabled && s.multiplier < 2) { s.multiplier = 2; changed = true; }
         }
         if(p.contains(QStringLiteral("hudProtect"))){
             const int mode=p.value(QStringLiteral("hudProtect"),-1).toInt();

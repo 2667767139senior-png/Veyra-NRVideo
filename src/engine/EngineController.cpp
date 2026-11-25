@@ -81,7 +81,7 @@ double elapsedMs(Clock::time_point from){return std::chrono::duration<double,std
 int64_t monotonic100ns(){return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()/100;}
 struct OnExit {std::function<void()> action;~OnExit(){action();}};
 bool usesVfgMedium(const EnhancementSettings& s) {
-    return s.frameGenerationBackend==FrameGenerationBackend::Vfg&&s.multiplier>1&&
+    return s.frameGenerationBackend==FrameGenerationBackend::Vfg&&s.usesFrameGeneration()&&
         (vfgPrimaryMode(s.vfgQuality)==1||(vfgMixedQuality(s.vfgQuality)&&vfgSecondaryMode(s.vfgQuality)==1)||
             (s.vfgQuality==2&&s.vfgAutoRegulate));
 }
@@ -373,7 +373,7 @@ bool EngineController::requestSettings(EnhancementSettings s,std::optional<Chain
         // Fail before changing desired state. This is a shape admission check,
         // not a GPU test; actual dimensions are compiled again at graph creation.
         StageRequest r;r.width=64;r.height=64;r.nr=s.nr;r.sr=s.sr;
-        r.fg=s.multiplier>1;r.fgMultiplier=s.multiplier;r.nodeOrder=&*order;
+        r.fg=s.usesFrameGeneration();r.fgMultiplier=s.liveMultiplier();r.nodeOrder=&*order;
         pipeline::EnhanceGraphDesc desc;describeStages(r,s,desc);
         if(const auto error=desc.validateFixedExecutionPlan();!error.empty()){
             veyra::log::warn("settings",std::format("node order rejected before commit: {}",error));
@@ -3213,6 +3213,18 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     else{fixedPlan.bypass=true;fixedPlan.reason="firstPair";}
                     previewFgMultiplier=std::max(2u,fixedPlan.count+1);
                     fixedPlanPtr=&fixedPlan;
+                }else if(options.settings.fgFixedTarget.enabled){
+                    // Selected but not running - the failure mode that looked like "the
+                    // feature does nothing": the mode is on, the panel hides the
+                    // multiplier, and some gate below never let it in. Name the gate.
+                    static uint64_t nextFixedTargetRefusalLog=0;
+                    if(host100ns()>=nextFixedTargetRefusalLog){
+                        nextFixedTargetRefusalLog=host100ns()+10000000;
+                        veyra::log::warn("fixed-target",std::format("mode=on but not running: fg={} backend={} image={} presentSink={} liveMultiplier={} usesFg={} (fix the named gate; the mode itself is enabled)",
+                            options.fg?1:0,int(options.settings.frameGenerationBackend),isImage?1:0,
+                            presentSinkFrameGeneration(options.settings.frameGenerationBackend)?1:0,
+                            options.settings.liveMultiplier(),options.settings.usesFrameGeneration()?1:0));
+                    }
                 }
                 // Live output hint: the panel cannot show more than one new picture
                 // per refresh, so suggest a multiplier that fits (DisplayFgBudget.h).

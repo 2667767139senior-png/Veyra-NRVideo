@@ -61,7 +61,10 @@ struct PlayerOptions { bool nr=false,sr=false,fg=false,realtime=true; uint32_t f
     std::wstring audioPath;
     EnhancementSettings snapshot()const{auto s=settings;s.nr=nr;s.sr=sr;s.multiplier=fg?fgMultiplier:1;s.nrPolicy=realtime?(settings.nrPolicy==pipeline::NrSizePolicy::Native?pipeline::NrSizePolicy::Realtime:settings.nrPolicy):pipeline::NrSizePolicy::Native;return s;}
     static PlayerOptions from(EnhancementSettings s,std::optional<ChainRuntimeOrder> order=std::nullopt,const PlayerOptions* keep=nullptr){
-        PlayerOptions o;o.nr=s.nr;o.sr=s.sr;o.fg=s.multiplier>1;o.fgMultiplier=std::max(2u,s.multiplier);o.realtime=s.nrPolicy!=pipeline::NrSizePolicy::Native;o.settings=s;o.nodeOrder=order;
+        // usesFrameGeneration(), not multiplier>1: 固定目标帧率 decides the pair
+        // count itself and hides the multiplier control, so a stored multiplier of
+        // 1 must still run frame generation.
+        PlayerOptions o;o.nr=s.nr;o.sr=s.sr;o.fg=s.usesFrameGeneration();o.fgMultiplier=std::max(2u,s.liveMultiplier());o.realtime=s.nrPolicy!=pipeline::NrSizePolicy::Native;o.settings=s;o.nodeOrder=order;
         // Per-open state that EnhancementSettings does not carry: a rebuild would
         // otherwise drop the DASH audio address and the site's request headers.
         if(keep){o.audioPath=keep->audioPath;o.network.requestHeaders=keep->network.requestHeaders;o.network.userAgent=keep->network.userAgent;}

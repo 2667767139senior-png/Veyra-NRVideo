@@ -1123,6 +1123,13 @@ bool QmlPlayerBridge::fgEnabled() const {
     return node && node->enabled;
 }
 void QmlPlayerBridge::setFgEnabled(bool enabled) {
+    // The card switch is the outer gate: 固定目标帧率 raises the multiplier floor
+    // while it is on, so leaving the mode set would keep the engine generating
+    // after the user turned generation off. Clear it here, the way switching the
+    // backend away from VFG already does.
+    if (!enabled && settings().fgFixedTarget.enabled) {
+        auto off = settings().fgFixedTarget; off.enabled = false; commitFixedTarget(off, "card off");
+    }
     for (uint32_t i = 0; i < impl_->chain.nodeCount; ++i)
         if (impl_->chain.nodes[i].type == engine::EffectType::FrameGeneration) {
             if (impl_->chain.nodes[i].enabled == enabled) return;

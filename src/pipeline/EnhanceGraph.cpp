@@ -5106,10 +5106,10 @@ bool EnhanceGraph::applySettings(const engine::EnhancementSettings& s){
     // desc_.fgMultiplier keeps the user's M (the present sink and the export job read
     // it); the fixed-target pool size is derived from these two by vfgSlotCount().
     desc_.fgFixedTarget=s.effectiveFixedTarget();
-    desc_.fgMultiplier=std::max(2u,s.multiplier);
+    desc_.fgMultiplier=std::max(2u,s.liveMultiplier());
     const bool temporalMotion=s.usesNrTemporal();
     desc_.enableNvofStandalone=s.nr&&!desc_.stillImage&&(desc_.nrUsesFlow()||temporalMotion);nvofStandalone_=desc_.enableNvofStandalone;
-    setNrEnabled(s.nr);setFgEnabled(s.multiplier>1&&!engine::presentSinkFrameGeneration(s.frameGenerationBackend));
+    setNrEnabled(s.nr);setFgEnabled(s.usesFrameGeneration()&&!engine::presentSinkFrameGeneration(s.frameGenerationBackend));
     veyra::log::info("settings",std::format("requested revision={} intensity={} tone={} structure={} skin={} style={} autoMask={} UI={} residual={}/{}/{}/{}/{} multiplier={}",s.revision,s.model.intensity,s.model.tone,s.model.structure,s.model.skin,s.model.style,s.model.autoMask,s.model.uiCorrection,s.residual.total,s.residual.darken,s.residual.brighten,s.residual.color,s.residual.luminance,s.multiplier));
     return true;
 }

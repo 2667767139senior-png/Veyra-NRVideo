@@ -336,6 +336,14 @@ engine::FixedTargetConfig normalizedFixedTarget(engine::FixedTargetConfig c) {
 int QmlPlayerBridge::fgMode() const { return settings().fgFixedTarget.enabled ? 1 : 0; }
 void QmlPlayerBridge::setFgMode(int value) {
     if (value != 0 && value != 1) return;
+    // Refuse instead of storing a mode nothing reads: the per-pair count is wired
+    // to VFG's FrameMultiplier/FrameIndex. The panel greys the row out, and this
+    // covers the other entry points (presets, older bindings).
+    if (value == 1 && settings().frameGenerationBackend != engine::FrameGenerationBackend::Vfg) {
+        emit notice(tr("固定目标帧率需要补帧方式选 NVIDIA VFG"), true);
+        emit settingsChanged();
+        return;
+    }
     auto next = settings().fgFixedTarget;
     if (next.enabled == (value == 1)) return;
     next.enabled = value == 1;
@@ -357,10 +365,29 @@ int QmlPlayerBridge::fgFixedTargetClampMaxMs() const { return int(std::lround(se
 void QmlPlayerBridge::commitFixedTarget(engine::FixedTargetConfig next, const char* what) {
     auto s = settings();
     next = normalizedFixedTarget(next);
-    if (!(s.fgFixedTarget == next)) {
+    // Choosing this mode IS choosing frame generation: the pair count supplies the
+    // width, which is why the panel hides the multiplier. Turn the card's node on
+    // and raise the multiplier floor first, so the settings we are about to commit
+    // already agree with the engine - a stored 1 used to switch the whole FG path
+    // off and leave the mode selected but dead.
+    if (next.enabled) {
+        if (!fgEnabled()) setFgEnabled(true);
+        s = settings();
+        if (s.multiplier < 2) s.multiplier = 2;
+    }
+    const uint32_t before = s.multiplier;
+    if (!(s.fgFixedTarget == next) || s.multiplier != before) {
         s.fgFixedTarget = next;
         if (!impl_->commit(std::move(s))) { emit notice(tr("引擎未接受固定目标帧率设置，原设置保留"), true); emit settingsChanged(); return; }
     }
+    const auto live = settings();
+    veyra::log::info("ui-fixed-target", "what=" + std::string(what) + " mode=" + (next.enabled ? "on" : "off") +
+        " targetFps=" + std::to_string(int(std::lround(next.targetFps))) +
+        " maxRuns=" + std::to_string(next.maxRuns) +
+        " smoothing=" + std::to_string(next.smoothing) +
+        " multiplier=" + std::to_string(live.multiplier) +
+        " backend=" + std::to_string(int(live.frameGenerationBackend)) +
+        " (multiplier is only the pool floor here; the per-pair count sets the real width)");
     impl_->prefs[QStringLiteral("fgFixedTarget")] = next.enabled;
     impl_->prefs[QStringLiteral("fgFixedTargetFps")] = int(std::lround(next.targetFps));
     impl_->prefs[QStringLiteral("fgFixedTargetSmoothing")] = next.smoothing;

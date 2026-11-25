@@ -3,6 +3,7 @@
 #include "veyra/engine/HdrOutputTuning.h"
 #include "veyra/engine/FixedTargetSchedule.h"
 #include <cmath>
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <string>
@@ -564,7 +565,27 @@ struct EnhancementSettings {
     // The mode only exists for live VFG. A saved profile can carry the flag while
     // the backend was something else, and that must not size a generated pool.
     FixedTargetConfig effectiveFixedTarget() const {
-        return multiplier>1&&frameGenerationBackend==FrameGenerationBackend::Vfg?fgFixedTarget:FixedTargetConfig{};
+        return fixedTargetLive()?fgFixedTarget:FixedTargetConfig{};
+    }
+    // 固定目标帧率 is a generation MODE, not an option on top of a multiplier: the
+    // panel hides the multiplier control while it is selected, because the pair
+    // count decides how many frames a pair gets. Everything downstream used to be
+    // gated on multiplier>1 though, so a stored multiplier of 1 switched the whole
+    // FG path off and the scheduler never ran - the mode looked enabled and did
+    // nothing. Treat the mode itself as the switch.
+    bool fixedTargetLive() const {
+        return fgFixedTarget.enabled&&frameGenerationBackend==FrameGenerationBackend::Vfg&&
+            !presentSinkFrameGeneration(frameGenerationBackend);
+    }
+    // The multiplier the engine should run with. Under fixed target it is only a
+    // floor for the generated-slot pool (the per-pair count supplies the real
+    // width), so a stored 1 must not disable generation.
+    uint32_t liveMultiplier() const {
+        return fixedTargetLive()?std::max(2u,multiplier):multiplier;
+    }
+    // Single source of truth for "is frame generation on at all".
+    bool usesFrameGeneration() const {
+        return liveMultiplier()>1;
     }
     // UI "帧节奏修复" (engine/FramePacingRepair.h, from PushFPS): even times for a locked
     // game whose frames arrive unevenly (17/50 ms). Re-times frames on the engine thread only.
