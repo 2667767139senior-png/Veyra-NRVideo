@@ -1726,12 +1726,16 @@ VPage {
                     label: qsTr("目标帧率")
                     objectName: "node-fg-fixed-target-rate"
                     visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget
-                    hint: qsTr("需要高于真实源帧率；源帧率已经达到或超过它时自动旁路，不插帧")
-                    VSelect {
-                        objectName: "node-fg-fixed-target-rate-select"
-                        options: [{id:"60",label:"60 FPS"},{id:"72",label:"72 FPS"},{id:"80",label:"80 FPS"},{id:"100",label:"100 FPS"},{id:"120",label:"120 FPS"},{id:"144",label:"144 FPS"}]
-                        value: veyra.fgFixedTargetFps + " FPS"
-                        onPicked: id => veyra.fgFixedTargetFps = Number(id)
+                    hint: qsTr("0～160 任意整数：点右侧数字直接输入，或拖滑块。要高于真实源帧率；源帧率已达到或超过它时自动旁路不插帧，填 0 就是完全不生成")
+                    value: veyra.fgFixedTargetFps + " FPS"
+                    VSlider {
+                        objectName: "node-fg-fixed-target-rate-slider"
+                        valueFromModel: true
+                        implicitWidth: 130
+                        inputDecimals: 0
+                        from: 0; to: 160; stepSize: 1
+                        value: veyra.fgFixedTargetFps
+                        onMoved: value => veyra.fgFixedTargetFps = Math.round(value)
                     }
                 }
                 VRow {

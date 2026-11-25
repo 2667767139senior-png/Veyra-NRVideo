@@ -69,12 +69,25 @@ struct FixedTargetConfig {
 
 inline bool fixedTargetValid(const FixedTargetConfig& c){
     if(!c.enabled)return true;
-    return std::isfinite(c.targetFps)&&c.targetFps>=20.0&&c.targetFps<=480.0&&
+    // 0 is accepted and means "no generation" (plan() reports targetOff): the
+    // panel offers the type-in field 0-160, and a target that low can only be
+    // read as a request to stop inserting rather than as an error.
+    return std::isfinite(c.targetFps)&&c.targetFps>=0.0&&c.targetFps<=480.0&&
         std::isfinite(c.smoothing)&&c.smoothing>=0.0&&c.smoothing<=1.0&&
         std::isfinite(c.clampMinMs)&&std::isfinite(c.clampMaxMs)&&c.clampMinMs>0.0&&c.clampMaxMs>=c.clampMinMs&&
         std::isfinite(c.maxIntervalMs)&&c.maxIntervalMs>=c.clampMaxMs&&
         c.maxRuns>=1&&c.maxRuns<=kFixedTargetMaxTicks&&
         std::isfinite(c.nearStart)&&c.nearStart>=0.0&&c.nearStart<0.5;
+}
+
+// Runs per interval a target rate needs at the slowest content this mode is
+// meant for (25 FPS = 40 ms): 40 ms at 120 FPS is 4.8 ticks, so four runs would
+// drop a grid point in every interval. 80 FPS comes out at four, the historical
+// default; callers keep maxRuns in step with the target instead of hard-coding
+// it, so typing 144 FPS does not silently arrive capped at 4.
+inline unsigned fixedTargetRunsFor(double targetFps){
+    if(!(targetFps>0.0)||!std::isfinite(targetFps))return 4u;
+    return std::clamp(static_cast<unsigned>(std::ceil(targetFps/25.0)),2u,kFixedTargetMaxTicks);
 }
 
 // The two fields the graph is built around: whether the mode runs at all, and how
@@ -113,7 +126,7 @@ class FixedTargetScheduler {
 public:
     struct Stats {
         uint64_t intervals=0,ticks=0,droppedByCap=0;
-        uint64_t bypassLong=0,bypassAtTarget=0,bypassInvalid=0,resyncs=0;
+        uint64_t bypassLong=0,bypassAtTarget=0,bypassInvalid=0,bypassOff=0,resyncs=0;
         unsigned lastTicks=0;
         double lastSpanMs=0,lastSmoothedSpanMs=0;
     };
@@ -133,6 +146,13 @@ public:
         FixedTargetPlan out;
         out.realPts100ns=b100ns;
         if(!config_.enabled){out.reason="off";return out;}
+        // A zero target is the panel's "insert nothing" value. The grid period
+        // would be 1/0, so it has to be caught before the division, and the pair
+        // is submitted exactly as it came in.
+        if(!(config_.targetFps>0.0)){
+            ++stats_.bypassOff;out.bypass=true;out.reason="targetOff";
+            phaseValid_=false;return out;
+        }
         const int64_t span=b100ns-a100ns;
         if(span<=0){
             ++stats_.bypassInvalid;out.bypass=true;out.reason="interval";

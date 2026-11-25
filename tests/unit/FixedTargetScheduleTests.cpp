@@ -183,6 +183,17 @@ int main() {
         check(fixedTargetCapacity(off, 2) == 2, "multiplier mode keeps the requested multiplier");
     }
 
+    // The panel now takes any integer 0-160, so the run cap has to follow the
+    // typed rate: at 40 ms of content, 120 FPS needs five ticks and 144 needs six.
+    {
+        check(fixedTargetRunsFor(80.0) == 4, "80 FPS keeps the historical four runs");
+        check(fixedTargetRunsFor(60.0) == 3, "60 FPS needs three runs at 40 ms");
+        check(fixedTargetRunsFor(120.0) == 5, "120 FPS gets a fifth run so nothing is dropped");
+        check(fixedTargetRunsFor(144.0) == 6, "144 FPS reaches the batch ceiling");
+        check(fixedTargetRunsFor(160.0) == kFixedTargetMaxTicks, "160 FPS stays inside the ceiling");
+        check(fixedTargetRunsFor(0.0) == 4, "a zero target leaves the default alone");
+    }
+
     // The real frame takes the first output grid point at or after B. That is what
     // keeps every submitted interval at exactly one period, and it bounds the cost:
     // the pair is never held longer than one output period.
@@ -219,9 +230,17 @@ int main() {
 
     // Validation.
     {
-        FixedTargetConfig c = config(0.0);
-        check(!fixedTargetValid(c), "a zero target is rejected");
-        c = config(80);
+        // 0 is the panel's "insert nothing" value, so it has to be accepted and
+        // turned into a bypass rather than rejected or divided by.
+        FixedTargetConfig zero = config(0.0);
+        check(fixedTargetValid(zero), "a zero target is accepted as 'generate nothing'");
+        FixedTargetScheduler z;
+        z.configure(zero);
+        const auto zplan = z.plan(ms(100), ms(133), 30.0);
+        check(zplan.bypass && zplan.count == 0 && std::string(zplan.reason) == "targetOff",
+              "a zero target bypasses the pair instead of dividing by zero");
+        check(z.stats().bypassOff == 1, "the zero-target bypass is counted");
+        FixedTargetConfig c = config(80);
         c.maxRuns = kFixedTargetMaxTicks + 1;
         check(!fixedTargetValid(c), "maxRuns above the batch capacity is rejected");
         c = config(80);

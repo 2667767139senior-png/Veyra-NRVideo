@@ -63,6 +63,13 @@ def capacity(cfg: Config, requested: int) -> int:
     return max(requested, min(cfg.max_runs, MAX_TICKS) + 1)
 
 
+def runs_for(target_fps: float) -> int:
+    """Port of engine::fixedTargetRunsFor: runs a target rate needs at 40 ms."""
+    if not (target_fps > 0.0):
+        return 4
+    return min(max(int(-(-target_fps // 25.0)), 2), MAX_TICKS)
+
+
 class Scheduler:
     """Port of engine::FixedTargetScheduler."""
 
@@ -72,12 +79,18 @@ class Scheduler:
         self.phase_valid = False
         self.smoothed = 0.0
         self.stats = {"intervals": 0, "ticks": 0, "dropped": 0,
-                      "long": 0, "at_target": 0, "invalid": 0, "resync": 0}
+                      "long": 0, "at_target": 0, "invalid": 0, "off": 0, "resync": 0}
 
     def plan(self, a: int, b: int, content_fps: float) -> Plan:
         out = Plan()
         out.real = b
         span = b - a
+        if not (self.cfg.target_fps > 0.0):
+            self.stats["off"] += 1
+            out.bypass = True
+            out.reason = "targetOff"
+            self.phase_valid = False
+            return out
         if span <= 0:
             self.stats["invalid"] += 1
             out.bypass = True
@@ -262,6 +275,28 @@ def main() -> int:
     cap_ok = capacity(base, 2) == 5 and capacity(base, 8) == 8 and capacity(Config(80, 6), 2) == 7
     print(f"  {'PASS' if cap_ok else 'FAIL'}  generated-slot capacity covers maxRuns + the real frame")
     fails += not cap_ok
+
+    # The panel takes any integer 0-160 now, so the run cap follows what was typed
+    # and 0 means "insert nothing" instead of a division by zero.
+    print("Typed targets (0-160)")
+    runs_ok = (runs_for(80) == 4 and runs_for(120) == 5 and runs_for(144) == 6
+               and runs_for(160) == MAX_TICKS and runs_for(0) == 4)
+    print(f"  {'PASS' if runs_ok else 'FAIL'}  run cap follows the target: 80->{runs_for(80)} "
+          f"120->{runs_for(120)} 144->{runs_for(144)} 160->{runs_for(160)}")
+    fails += not runs_ok
+    off_pts, off_counts, off_st = simulate(Config(0), steady, content_fps=30.0)
+    off_ok = off_st["off"] == len(off_counts) and sum(off_counts) == 0
+    print(f"  {'PASS' if off_ok else 'FAIL'}  target 0 inserts nothing "
+          f"({off_st['off']} pairs bypassed)")
+    fails += not off_ok
+    for target, source in ((100, 30.0), (120, 30.0), (144, 30.0), (160, 30.0), (120, 25.0)):
+        cfg = Config(target, runs_for(target))
+        pts, counts, st = simulate(cfg, [1000.0 / source] * 120, content_fps=source)
+        lo2, hi2, pct2 = spread(intervals(pts))
+        ok = st["dropped"] == 0 and pct2 < 1.0
+        print(f"  {'PASS' if ok else 'FAIL'}  {source:.0f} FPS -> {target} FPS at maxRuns={cfg.max_runs}: "
+              f"{min(counts)}-{max(counts)} runs, dropped {st['dropped']}, spread {pct2:.2f}%")
+        fails += not ok
 
     # Comparison against the current multiplier mode on the wobbling source.
     print("Multiplier mode on the same 30<->25 FPS source (for comparison)")

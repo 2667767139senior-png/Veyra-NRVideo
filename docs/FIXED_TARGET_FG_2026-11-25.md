@@ -73,7 +73,9 @@ NVIDIA VFX SDK 的 VFG 有两种互斥的插值方式：
 - **设置**：`EnhancementSettings::fgFixedTarget`（`FixedTargetConfig`）。
 - **结构 vs 逐对**：`enabled` 与 `maxRuns` 决定生成槽位数量，改它会重建图；`targetFps`、`smoothing`、`clamp*`、`maxIntervalMs`、`nearStart` 只影响每对计划，改它们不重建（`fixedTargetSameStructure()` / `sameVideoConfiguration()`）。
 - **持久化**：跟"自适应倍率""帧节奏修复"一样是外壳偏好（`fgFixedTarget`、`fgFixedTargetFps`、`fgFixedTargetSmoothing`、`fgFixedTargetClampMinMs`、`fgFixedTargetClampMaxMs`），不进预设。
-- **UI**：专业页与节点页的补帧分组里，"固定目标帧率"开关（只在 VFG 且倍率 >1 时可见）、目标帧率选择（60/72/80/100/120/144）、帧间隔平滑滑块、帧间隔上下限滑块（只在平滑 > 0 时显示）。
+- **UI**：专业页与节点页的补帧分组里，"固定目标帧率"开关（只在 VFG 且倍率 >1 时可见）、目标帧率滑块（**0~160 任意整数**，点右侧数字可直接输入，按 ↑↓ 走 1）、帧间隔平滑滑块、帧间隔上下限滑块（只在平滑 > 0 时显示）。
+- **目标帧率取值 0~160**（2026-11-25 追加）：面板不再给固定档位。填 `0` 表示"完全不生成"——`fixedTargetValid()` 接受 0，`plan()` 在最前面就把它变成 `bypass=true, reason=targetOff`，不会走到 `1/0` 的除法。`normalizedFixedTarget()` 把输入钳到 `[0,160]`。
+- **`maxRuns` 跟着目标帧率走**：`fixedTargetRunsFor(targetFps) = clamp(ceil(targetFps/25), 2, 6)`，按"最慢的 25 fps 内容（40 ms）"算需要几个 tick。80 → 4（历史默认不变）、100 → 4、120 → 5、144 → 6、160 → 6。UI 提交与偏好恢复两条路都调用它，所以手输 144 不会悄悄被旧的 4 截断成丢帧。改目标帧率跨档（4→5/6）会重建一次图，这是槽位数量变化决定的。
 
 ## 统计
 
@@ -81,8 +83,8 @@ NVIDIA VFX SDK 的 VFG 有两种互斥的插值方式：
 
 ```
 revision=<n> targetFps=<f> contentFps=<f> sourceMs=<f> smoothedMs=<f> ticks=<n>
-realGridDelayMs=<f> bypass=<0|1> reason=<ticks|none|longInterval|sourceAtTarget|interval|firstPair>
-intervals=<n> ticks=<n> droppedByCap=<n> bypassLong=<n> bypassAtTarget=<n> resyncs=<n>
+realGridDelayMs=<f> bypass=<0|1> reason=<ticks|none|longInterval|sourceAtTarget|targetOff|interval|firstPair>
+intervals=<n> ticks=<n> droppedByCap=<n> bypassLong=<n> bypassAtTarget=<n> bypassOff=<n> resyncs=<n>
 ```
 
 `realGridDelayMs` 是真实帧被吸附到网格上多出来的延迟，正常应该 < 1000/targetFps。
@@ -124,8 +126,8 @@ Sweep: worst interval deviation: 0.00 us (94 combinations excluded as capped or 
 
 ## 尚未确定、需要确认
 
-1. **目标帧率的取值**：现在 UI 给 60/72/80/100/120/144，调度器接受 20~480。要不要跟显示器刷新率绑定（例如只允许刷新率的整数分频）？
-2. **`maxRuns` 是否暴露给用户**：现在固定 4（上限 6）。20 fps 源 + 120 fps 目标需要 6 帧，被截断成 4 会留下空洞（仿真里明确标为 capped）。
+1. ~~**目标帧率的取值**：现在 UI 给 60/72/80/100/120/144，调度器接受 20~480。要不要跟显示器刷新率绑定？~~ 已改为 0~160 任意整数（见上文），是否再跟刷新率绑定仍未定。
+2. ~~**`maxRuns` 是否暴露给用户**：现在固定 4（上限 6）。20 fps 源 + 120 fps 目标需要 6 帧，被截断成 4 会留下空洞。~~ 已改为随目标帧率自动派生（`fixedTargetRunsFor`）；160 fps 目标配 20 fps 源（50 ms）仍会超上限，这是 GPU 侧的上限，暂不放开。
 3. **输出上限的交互**：`fixed_target` 计划在"输出上限（自定义 fps）"之后计算，会用 `count+1` 覆盖上限推导出来的倍率。上限仍由提交端做残差丢弃，但更合理的做法可能是把 `target_fps` 直接钳到上限。
 4. **和"自适应倍率"共存**：自适应倍率会先算一个倍率，随后被固定目标帧率的 `count+1` 覆盖，等于失效。要不要在固定目标帧率打开时禁用/隐藏自适应倍率？
 5. **和"VFG 自动调控"共存**：2X 快档捷径（读的是"每对一次"的耗时，固定目标下每对帧数在变）已在该模式下关闭；`vfgOverload` 的全组采样改用计划自己的 tick 数。这两处是有意的取舍，需要真机确认快档在这个模式下还有没有用。

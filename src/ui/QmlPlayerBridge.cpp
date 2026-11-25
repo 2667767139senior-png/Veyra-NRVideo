@@ -299,6 +299,9 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             if (p.contains(QStringLiteral("fgFixedTargetSmoothing"))) fixed.smoothing = p.value(QStringLiteral("fgFixedTargetSmoothing")).toDouble();
             if (p.contains(QStringLiteral("fgFixedTargetClampMinMs"))) fixed.clampMinMs = p.value(QStringLiteral("fgFixedTargetClampMinMs")).toDouble();
             if (p.contains(QStringLiteral("fgFixedTargetClampMaxMs"))) fixed.clampMaxMs = p.value(QStringLiteral("fgFixedTargetClampMaxMs")).toDouble();
+            // The run cap is derived, not stored: a profile from before the panel
+            // took arbitrary rates still has the historical four.
+            fixed.maxRuns = engine::fixedTargetRunsFor(fixed.targetFps);
             // A profile written by an older build (or hand-edited) must not reach the
             // scheduler outside its accepted ranges; keep the defaults otherwise.
             if (engine::fixedTargetValid(fixed) && !(s.fgFixedTarget == fixed)) { s.fgFixedTarget = fixed; changed = true; }

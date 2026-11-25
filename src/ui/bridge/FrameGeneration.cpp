@@ -308,7 +308,12 @@ void QmlPlayerBridge::setHudProtect(int value) {
 // mode itself and maxRuns change the graph, the rest is read per pair.
 namespace {
 engine::FixedTargetConfig normalizedFixedTarget(engine::FixedTargetConfig c) {
-    c.targetFps = std::clamp(std::isfinite(c.targetFps) ? c.targetFps : 80.0, 24.0, 240.0);
+    // 0-160 with 0 meaning "insert nothing": the panel takes any integer in that
+    // range, and the scheduler turns 0 into a bypass rather than a division.
+    c.targetFps = std::clamp(std::isfinite(c.targetFps) ? c.targetFps : 80.0, 0.0, 160.0);
+    // The cap has to follow the rate the user typed, or 120 FPS and above would
+    // arrive capped at four ticks per interval and show up as dropped frames.
+    c.maxRuns = engine::fixedTargetRunsFor(c.targetFps);
     c.smoothing = std::clamp(std::isfinite(c.smoothing) ? c.smoothing : 0.0, 0.0, 1.0);
     c.clampMinMs = std::clamp(std::isfinite(c.clampMinMs) ? c.clampMinMs : 25.0, 4.0, 200.0);
     c.clampMaxMs = std::clamp(std::isfinite(c.clampMaxMs) ? c.clampMaxMs : 60.0, c.clampMinMs, 400.0);

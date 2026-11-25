@@ -3467,10 +3467,10 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 if(processed&&fixedPlanPtr&&host100ns()>=nextFixedTargetLog){
                     nextFixedTargetLog=host100ns()+10000000;
                     const auto& st=fixedTarget.stats();
-                    veyra::log::info("fixed-target",std::format("revision={} targetFps={:.2f} contentFps={:.2f} sourceMs={:.3f} smoothedMs={:.3f} ticks={} realGridDelayMs={:.3f} bypass={} reason={} intervals={} ticksTotal={} dropped={} bypassLong={} bypassAtTarget={} resyncs={} (output clock 1/targetFps on the content clock; ticks = generated frames inside this pair, realGridDelayMs = how far B moved onto the grid, bypass = the pair ran as-is)",
+                    veyra::log::info("fixed-target",std::format("revision={} targetFps={:.2f} contentFps={:.2f} sourceMs={:.3f} smoothedMs={:.3f} ticks={} realGridDelayMs={:.3f} bypass={} reason={} intervals={} ticksTotal={} dropped={} bypassLong={} bypassAtTarget={} bypassOff={} resyncs={} (output clock 1/targetFps on the content clock; ticks = generated frames inside this pair, realGridDelayMs = how far B moved onto the grid, bypass = the pair ran as-is)",
                         options.settings.revision,options.settings.fgFixedTarget.targetFps,pairContentFps,st.lastSpanMs,st.lastSmoothedSpanMs,
                         fixedPlanPtr->count,double(fixedPlanPtr->realPts100ns-int64_t(std::llround(pts*10000.0)))/10000.0,
-                        fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.ticks,st.droppedByCap,st.bypassLong,st.bypassAtTarget,st.resyncs));
+                        fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.ticks,st.droppedByCap,st.bypassLong,st.bypassAtTarget,st.bypassOff,st.resyncs));
                 }
                 if(!processed){
                     const auto failedComponent=graph->failedBackend();
