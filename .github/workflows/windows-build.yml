@@ -186,6 +186,17 @@ jobs:
           }
           Copy-Item C:\v\installed\x64-windows\bin\*.dll $stage
           Copy-Item C:\dovi\bin\*.dll $stage
+          # Moonlight's crypto links OpenSSL, and find_package may resolve it to the
+          # toolchain preinstalled on the runner rather than to vcpkg, so its DLL is
+          # not in the copy above. Ship whatever CMake actually linked against.
+          $cryptoLib = (Select-String -Path C:\b\CMakeCache.txt -Pattern '^OPENSSL_CRYPTO_LIBRARY:FILEPATH=(.+)$').Matches
+          if ($cryptoLib) {
+            $libDir = Split-Path $cryptoLib[0].Groups[1].Value.Trim()
+            foreach ($cand in @($libDir, "$libDir\..\bin", "$libDir\..\..\bin", "$libDir\..\..\..\bin")) {
+              Get-ChildItem -Path $cand -Filter 'libcrypto*.dll' -ErrorAction SilentlyContinue |
+                ForEach-Object { Copy-Item $_.FullName $stage -Force; "openssl: $($_.FullName)" }
+            }
+          }
           & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --qmldir qml --no-translations `
             --skip-plugin-types qmltooling,generic "$stage\veyra_qml_ui.exe"
           if ($LASTEXITCODE -ne 0) { throw "windeployqt failed with exit code $LASTEXITCODE" }
@@ -215,6 +226,25 @@ jobs:
             sdks = (Get-Content C:\sdk-manifest.json -Raw | ConvertFrom-Json)
             notIncluded = 'Proprietary GPU runtimes (runtime/, runtime_local/), BGM, VB-CABLE package'
           } | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 "$stage\BUILD-INFO.json"
+
+      # A package that imports a DLL it does not ship dies on the user's machine with
+      # 0xc0000135 and nothing to debug. Resolve the closure here instead.
+      - name: Verify staged runtime dependencies
+        run: |
+          $stage = (Resolve-Path "C:\out\Veyra-$($env:GITHUB_SHA.Substring(0, 10))-win64-ci-no-gpu-runtimes").Path
+          $deps = (& dumpbin /nologo /dependents "$stage\veyra_qml_ui.exe" 2>&1) |
+            Select-String -Pattern '^\s+(\S+\.dll)\s*$' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object -Unique
+          if (-not $deps) { throw "dumpbin produced no dependency list" }
+          $missing = @()
+          foreach ($d in $deps) {
+            if ($d -like 'api-ms-win-*' -or $d -like 'ext-ms-*') { continue }
+            if (Test-Path -LiteralPath (Join-Path $stage $d)) { continue }
+            if (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\$d")) { continue }
+            $missing += $d
+          }
+          "imports: $($deps.Count) | unresolved: $($missing.Count)"
+          if ($missing) { throw "veyra_qml_ui.exe imports DLLs this package neither ships nor gets from Windows: $($missing -join ', ')" }
           Compress-Archive -Path $stage -DestinationPath "C:\out\$name.zip"
           Get-ChildItem C:\out\*.zip | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName).Hash.ToLowerInvariant(), $_.Name } |
             Set-Content -Encoding utf8 C:\out\SHA256SUMS.txt
