@@ -25,6 +25,11 @@ $nvofSha256 = @{
     'nvOpticalFlowCommon.h' = 'cdbdbf0797fc02d2de1051520d4164bb1e36b7722009f46cb16216675319436a'
     'nvOpticalFlowD3D12.h'  = 'f12bbc6c54278cb5d3ae81723ca0363644f672fc3e72b635a709470ffdd6886f'
 }
+# The Optical Flow SDK mirrors the CUDA driver header inside its FRUC sample. It is
+# the only public, login-free copy of cuda.h, and native NVIDIA VFG needs it: without
+# VEYRA_CUDA_DRIVER_INCLUDE_DIR the whole VfgBackend compiles to a stub and the player
+# reports VFG unavailable (docs/HISTORY.md).
+$cudaHeaderSha256 = 'b135cd01b9b54a1a7008159a9f6ea6faeade287b818f3fe83299a455e0d74a55'
 
 function Get-Pinned([string]$Repo, [string]$Commit, [string]$Dir) {
     if (Test-Path -LiteralPath $Dir) { Remove-Item -LiteralPath $Dir -Recurse -Force }
@@ -68,10 +73,15 @@ Copy-Tree (Join-Path $src['FFmpeg/nv-codec-headers'] 'include') (Join-Path $tpl 
 $nvof = Join-Path $tpl 'nvidia/Optical_Flow_SDK_5.0.7'
 Copy-Tree (Join-Path $src['mbucchia/Optical-Flow-SDK'] 'NvOFInterface') (Join-Path $nvof 'NvOFInterface')
 Copy-Tree (Join-Path $src['mbucchia/Optical-Flow-SDK'] 'Common/NvOFBase') (Join-Path $nvof 'Common/NvOFBase')
+Copy-Tree (Join-Path $src['mbucchia/Optical-Flow-SDK'] 'NvOFFRUC/NvOFFRUCSample/cudart_header') (Join-Path $nvof 'NvOFFRUC/NvOFFRUCSample/cudart_header')
 foreach ($h in $nvofSha256.Keys) {
     $got = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $nvof "NvOFInterface/$h")).Hash.ToLowerInvariant()
     if ($got -ne $nvofSha256[$h]) { throw "$h SHA-256 $got does not match $($nvofSha256[$h])" }
 }
+$cudaHeader = Join-Path $nvof 'NvOFFRUC/NvOFFRUCSample/cudart_header/cuda.h'
+if (-not (Test-Path -LiteralPath $cudaHeader)) { throw 'cuda.h missing; native VFG would build as a stub' }
+$got = (Get-FileHash -Algorithm SHA256 -LiteralPath $cudaHeader).Hash.ToLowerInvariant()
+if ($got -ne $cudaHeaderSha256) { throw "cuda.h SHA-256 $got does not match $cudaHeaderSha256" }
 
 $manifest = [ordered]@{ sdks = @($pins | ForEach-Object { [ordered]@{ name = $_.Name; repo = $_.Repo; commit = $_.Commit } }) }
 $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $ManifestOut -Encoding utf8

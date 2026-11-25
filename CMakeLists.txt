@@ -513,6 +513,11 @@ target_compile_definitions(veyra_pipeline PUBLIC
   VEYRA_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
 target_include_directories(veyra_pipeline PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set(VEYRA_CUDA_DRIVER_INCLUDE_DIR "" CACHE PATH "External CUDA driver headers for native VFG (never vendored)")
+if(VEYRA_CUDA_DRIVER_INCLUDE_DIR AND NOT EXISTS "${VEYRA_CUDA_DRIVER_INCLUDE_DIR}/cuda.h")
+  # Silently falling back would produce a player where VFG is a stub, which looks
+  # like "the GPU is not supported" at runtime. Fail where it is cheap to see.
+  message(FATAL_ERROR "VEYRA_CUDA_DRIVER_INCLUDE_DIR is set to '${VEYRA_CUDA_DRIVER_INCLUDE_DIR}' but cuda.h is not there")
+endif()
 if(EXISTS "${VEYRA_CUDA_DRIVER_INCLUDE_DIR}/cuda.h")
   target_include_directories(veyra_pipeline PRIVATE "${VEYRA_CUDA_DRIVER_INCLUDE_DIR}")
   target_compile_definitions(veyra_pipeline PRIVATE VEYRA_HAVE_CUDA_DRIVER_HEADERS=1)

@@ -139,10 +139,14 @@ jobs:
 
       - name: Configure (preset x64-release)
         run: |
+          # cuda.h comes from the pinned Optical Flow SDK snapshot, so the build
+          # compiles the real VfgBackend instead of its no-CUDA stub.
+          $cuda = (Resolve-Path 'third_party_local/nvidia/Optical_Flow_SDK_5.0.7/NvOFFRUC/NvOFFRUCSample/cudart_header').Path
           cmake --preset x64-release -B C:\b `
             -DVEYRA_BUILD_QML_UI=ON `
             -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON `
             "-DVEYRA_DLSS_SDK_ROOT=$((Resolve-Path third_party_local/nvidia/DLSS_SDK_310.7.0).Path)" `
+            "-DVEYRA_CUDA_DRIVER_INCLUDE_DIR=$cuda" `
             -DVEYRA_FFMPEG_ROOT=C:/v/installed/x64-windows `
             -DVEYRA_LIBASS_ROOT=C:/v/installed/x64-windows-static `
             -DVEYRA_LIBDOVI_ROOT=C:/dovi `
@@ -153,6 +157,14 @@ jobs:
           cmake --build C:\b --parallel --target veyra_qml_ui veyra_virtualcam_components
           $shaders = ninja -C C:\b -t targets all | ForEach-Object { ($_ -split ':')[0] } | Where-Object { $_ -match '^veyra_shader_' } | Sort-Object -Unique
           if ($shaders) { cmake --build C:\b --parallel --target @shaders }
+
+      # Fixed-target scheduling is pure arithmetic and needs no GPU, so the build
+      # proves the cadence promises here instead of leaving them to a device test.
+      - name: Run fixed-target schedule tests
+        run: |
+          cmake --build C:\b --target veyra_fixed_target_schedule_tests
+          & C:\b\veyra_fixed_target_schedule_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "veyra_fixed_target_schedule_tests failed with $LASTEXITCODE" }
 
       - name: Stage portable package
         run: |
