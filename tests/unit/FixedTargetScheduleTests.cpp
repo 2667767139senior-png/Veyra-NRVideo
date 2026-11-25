@@ -120,9 +120,12 @@ int main() {
         check(plan.bypass && plan.count == 0, "120 ms gap: bypass, no interpolation");
         check(plan.realPts100ns == ms(2120), "120 ms gap: the real frame keeps its own PTS");
         check(s.stats().bypassLong == 1 && s.stats().resyncs == 1, "120 ms gap: counted and re-synchronised");
-        const auto after = s.plan(ms(2120), ms(2153.333), 30.0);
+        const int64_t b = ms(2153.333);
+        const auto after = s.plan(ms(2120), b, 30.0);
         check(after.count >= 1 && !after.bypass, "after a stall the grid runs again at once");
-        check((after.realPts100ns - ms(2120)) <= ms(1000.0 / 80.0), "the first frame after a stall waits at most one period");
+        // The snap is measured against B, not against the stall: the real frame is
+        // never pushed past the first grid point at or after itself.
+        check((after.realPts100ns - b) <= ms(1000.0 / 80.0), "the first real frame after a stall is snapped within one period");
     }
 
     // A real 60 FPS source (menus) at a 60 FPS target has nothing to insert.
