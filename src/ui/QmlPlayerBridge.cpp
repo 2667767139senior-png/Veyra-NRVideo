@@ -289,6 +289,20 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             const bool on = p.value(QStringLiteral("hudLock")).toBool();
             if (s.hudLock != on) { s.hudLock = on; changed = true; }
         }
+        // 固定目标帧率 (engine/FixedTargetSchedule.h). The mode is only meaningful for
+        // live VFG, so it is restored as a stored preference either way and the panel
+        // greys it when the backend or the multiplier does not qualify.
+        {
+            engine::FixedTargetConfig fixed = s.fgFixedTarget;
+            if (p.contains(QStringLiteral("fgFixedTarget"))) fixed.enabled = p.value(QStringLiteral("fgFixedTarget")).toBool();
+            if (p.contains(QStringLiteral("fgFixedTargetFps"))) fixed.targetFps = p.value(QStringLiteral("fgFixedTargetFps")).toDouble();
+            if (p.contains(QStringLiteral("fgFixedTargetSmoothing"))) fixed.smoothing = p.value(QStringLiteral("fgFixedTargetSmoothing")).toDouble();
+            if (p.contains(QStringLiteral("fgFixedTargetClampMinMs"))) fixed.clampMinMs = p.value(QStringLiteral("fgFixedTargetClampMinMs")).toDouble();
+            if (p.contains(QStringLiteral("fgFixedTargetClampMaxMs"))) fixed.clampMaxMs = p.value(QStringLiteral("fgFixedTargetClampMaxMs")).toDouble();
+            // A profile written by an older build (or hand-edited) must not reach the
+            // scheduler outside its accepted ranges; keep the defaults otherwise.
+            if (engine::fixedTargetValid(fixed) && !(s.fgFixedTarget == fixed)) { s.fgFixedTarget = fixed; changed = true; }
+        }
         if(p.contains(QStringLiteral("hudProtect"))){
             const int mode=p.value(QStringLiteral("hudProtect"),-1).toInt();
             if(mode>=0&&mode<=int(engine::HudProtectMode::Regions)&&int(s.hudProtect)!=mode){

@@ -2023,6 +2023,72 @@ VPage {
                                 }
                             }
                             VRow {
+                                objectName: "list-fg-fixed-target"
+                                label: qsTr("固定目标帧率")
+                                visible: veyra.fgFixedTargetAvailable
+                                hint: qsTr("输出按固定节拍走：游戏从 30 掉到 25 帧时，这一对帧多生成一帧吸收波动，输出帧率不跟着掉。VFG 专属，开启后会重建补帧 · 默认关闭")
+                                VSwitch {
+                                    objectName: "list-fg-fixed-target-switch"
+                                    checked: veyra.fgFixedTarget
+                                    onToggled: checked => veyra.fgFixedTarget = checked
+                                }
+                            }
+                            VRow {
+                                objectName: "list-fg-fixed-target-rate"
+                                label: qsTr("目标帧率")
+                                visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget
+                                hint: qsTr("需要高于真实源帧率；源帧率已经达到或超过它时自动旁路，不插帧")
+                                VSelect {
+                                    objectName: "list-fg-fixed-target-rate-select"
+                                    options: [{id:"60",label:"60 FPS"},{id:"72",label:"72 FPS"},{id:"80",label:"80 FPS"},{id:"100",label:"100 FPS"},{id:"120",label:"120 FPS"},{id:"144",label:"144 FPS"}]
+                                    value: veyra.fgFixedTargetFps + " FPS"
+                                    onPicked: id => veyra.fgFixedTargetFps = Number(id)
+                                }
+                            }
+                            VRow {
+                                objectName: "list-fg-fixed-target-smoothing"
+                                label: qsTr("帧间隔平滑")
+                                visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget
+                                hint: qsTr("0 关闭：帧生成位置严格按真实帧间隔算，速度最准。大于 0 会按钳位范围做指数平滑，画面节奏更稳但位置略有偏差")
+                                value: veyra.fgFixedTargetSmoothing <= 0 ? qsTr("关闭") : Number(veyra.fgFixedTargetSmoothing).toFixed(2)
+                                VSlider {
+                                    objectName: "list-fg-fixed-target-smoothing-slider"
+                                    implicitWidth: 110
+                                    inputDecimals: 2
+                                    from: 0; to: 0.9
+                                    value: veyra.fgFixedTargetSmoothing
+                                    onMoved: value => veyra.fgFixedTargetSmoothing = value
+                                }
+                            }
+                            VRow {
+                                objectName: "list-fg-fixed-target-clamp-min"
+                                label: qsTr("帧间隔下限")
+                                visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget && veyra.fgFixedTargetSmoothing > 0
+                                hint: qsTr("平滑时把源帧间隔至少当成这么久（毫秒），避免真实帧率偏高时生成帧挤在区间开头")
+                                value: veyra.fgFixedTargetClampMinMs + " ms"
+                                VSlider {
+                                    objectName: "list-fg-fixed-target-clamp-min-slider"
+                                    implicitWidth: 110
+                                    from: 8; to: 60
+                                    value: veyra.fgFixedTargetClampMinMs
+                                    onMoved: value => veyra.fgFixedTargetClampMinMs = Math.round(value)
+                                }
+                            }
+                            VRow {
+                                objectName: "list-fg-fixed-target-clamp-max"
+                                label: qsTr("帧间隔上限")
+                                visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget && veyra.fgFixedTargetSmoothing > 0
+                                hint: qsTr("平滑时把源帧间隔最多当成这么久（毫秒）；超过 100 ms 的停顿不插帧，直接输出真实帧并重新对齐节拍")
+                                value: veyra.fgFixedTargetClampMaxMs + " ms"
+                                VSlider {
+                                    objectName: "list-fg-fixed-target-clamp-max-slider"
+                                    implicitWidth: 110
+                                    from: 20; to: 90
+                                    value: veyra.fgFixedTargetClampMaxMs
+                                    onMoved: value => veyra.fgFixedTargetClampMaxMs = Math.round(value)
+                                }
+                            }
+                            VRow {
                                 objectName: "list-pacing-repair"
                                 label: qsTr("帧节奏修复")
                                 visible: veyra.fgBackendName !== "xess"

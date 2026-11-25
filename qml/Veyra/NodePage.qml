@@ -1716,6 +1716,68 @@ VPage {
                     VSwitch { objectName: "node-vfg-auto-regulate"; checked: veyra.vfgAutoRegulate; onToggled: checked => veyra.vfgAutoRegulate = checked }
                 }
                 VRow {
+                    label: qsTr("固定目标帧率")
+                    objectName: "node-fg-fixed-target"
+                    visible: veyra.fgFixedTargetAvailable
+                    hint: qsTr("输出按固定节拍走：游戏从 30 掉到 25 帧时，这一对帧多生成一帧吸收波动，输出帧率不跟着掉。VFG 专属，开启后会重建补帧 · 默认关闭")
+                    VSwitch { objectName: "node-fg-fixed-target-switch"; checked: veyra.fgFixedTarget; onToggled: checked => veyra.fgFixedTarget = checked }
+                }
+                VRow {
+                    label: qsTr("目标帧率")
+                    objectName: "node-fg-fixed-target-rate"
+                    visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget
+                    hint: qsTr("需要高于真实源帧率；源帧率已经达到或超过它时自动旁路，不插帧")
+                    VSelect {
+                        objectName: "node-fg-fixed-target-rate-select"
+                        options: [{id:"60",label:"60 FPS"},{id:"72",label:"72 FPS"},{id:"80",label:"80 FPS"},{id:"100",label:"100 FPS"},{id:"120",label:"120 FPS"},{id:"144",label:"144 FPS"}]
+                        value: veyra.fgFixedTargetFps + " FPS"
+                        onPicked: id => veyra.fgFixedTargetFps = Number(id)
+                    }
+                }
+                VRow {
+                    label: qsTr("帧间隔平滑")
+                    objectName: "node-fg-fixed-target-smoothing"
+                    visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget
+                    hint: qsTr("0 关闭：帧生成位置严格按真实帧间隔算，速度最准。大于 0 会按钳位范围做指数平滑，画面节奏更稳但位置略有偏差")
+                    value: veyra.fgFixedTargetSmoothing <= 0 ? qsTr("关闭") : Number(veyra.fgFixedTargetSmoothing).toFixed(2)
+                    VSlider {
+                        objectName: "node-fg-fixed-target-smoothing-slider"
+                        implicitWidth: 110
+                        inputDecimals: 2
+                        from: 0; to: 0.9
+                        value: veyra.fgFixedTargetSmoothing
+                        onMoved: value => veyra.fgFixedTargetSmoothing = value
+                    }
+                }
+                VRow {
+                    label: qsTr("帧间隔下限")
+                    objectName: "node-fg-fixed-target-clamp-min"
+                    visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget && veyra.fgFixedTargetSmoothing > 0
+                    hint: qsTr("平滑时把源帧间隔至少当成这么久（毫秒）")
+                    value: veyra.fgFixedTargetClampMinMs + " ms"
+                    VSlider {
+                        objectName: "node-fg-fixed-target-clamp-min-slider"
+                        implicitWidth: 110
+                        from: 8; to: 60
+                        value: veyra.fgFixedTargetClampMinMs
+                        onMoved: value => veyra.fgFixedTargetClampMinMs = Math.round(value)
+                    }
+                }
+                VRow {
+                    label: qsTr("帧间隔上限")
+                    objectName: "node-fg-fixed-target-clamp-max"
+                    visible: veyra.fgFixedTargetAvailable && veyra.fgFixedTarget && veyra.fgFixedTargetSmoothing > 0
+                    hint: qsTr("平滑时把源帧间隔最多当成这么久（毫秒）；超过 100 ms 的停顿不插帧")
+                    value: veyra.fgFixedTargetClampMaxMs + " ms"
+                    VSlider {
+                        objectName: "node-fg-fixed-target-clamp-max-slider"
+                        implicitWidth: 110
+                        from: 20; to: 90
+                        value: veyra.fgFixedTargetClampMaxMs
+                        onMoved: value => veyra.fgFixedTargetClampMaxMs = Math.round(value)
+                    }
+                }
+                VRow {
                     label: qsTr("自适应倍率")
                     visible: veyra.fgMultiplier > 2 && (veyra.fgBackendName === "dlss" || veyra.fgBackendName === "anr" || veyra.fgBackendName === "vfg")
                     hint: qsTr("把所选倍率当上限，按游戏实时帧率逐对选用最接近目标帧率（输出上限或屏幕刷新率）的倍率，游戏掉帧时输出仍保持平稳；不重建补帧 · 默认关闭")

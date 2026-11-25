@@ -1,6 +1,7 @@
 #pragma once
 #include "veyra/engine/VideoHdrSettings.h"
 #include "veyra/engine/HdrOutputTuning.h"
+#include "veyra/engine/FixedTargetSchedule.h"
 #include <cmath>
 #include <array>
 #include <cstdint>
@@ -553,6 +554,18 @@ struct EnhancementSettings {
     // Changes only the per-pair multiplier, never the graph, so the configuration
     // comparisons below leave it out. A global control kept in shell preferences.
     bool fgAdaptive=false;
+    // UI "固定目标帧率" (engine/FixedTargetSchedule.h): VFG only. The output runs on
+    // a free-running 1/targetFps grid instead of i/M inside every pair, so a 30 FPS
+    // picture that dips to 25 FPS keeps its output cadence. Disabled keeps multiplier
+    // mode exactly as it is. Only the mode and the run cap shape the graph (they size
+    // the generated slot pool); the rate and the smoothing/clamp knobs are read per
+    // pair, so the comparisons below let them change without a rebuild.
+    FixedTargetConfig fgFixedTarget{};
+    // The mode only exists for live VFG. A saved profile can carry the flag while
+    // the backend was something else, and that must not size a generated pool.
+    FixedTargetConfig effectiveFixedTarget() const {
+        return multiplier>1&&frameGenerationBackend==FrameGenerationBackend::Vfg?fgFixedTarget:FixedTargetConfig{};
+    }
     // UI "帧节奏修复" (engine/FramePacingRepair.h, from PushFPS): even times for a locked
     // game whose frames arrive unevenly (17/50 ms). Re-times frames on the engine thread only.
     bool pacingRepair=false;
@@ -605,6 +618,9 @@ struct EnhancementSettings {
             active.frameGenerationBackend=defaults.frameGenerationBackend;active.vfgQuality=defaults.vfgQuality;
             active.fgMotion=defaults.fgMotion;active.fgStrictAdmission=defaults.fgStrictAdmission;
         }else if(frameGenerationBackend!=FrameGenerationBackend::Vfg)active.vfgQuality=defaults.vfgQuality;
+        // Fixed target is a VFG capability; without frame generation it has nothing
+        // to schedule, and toggling it must not invalidate an unrelated graph.
+        if(multiplier<=1||frameGenerationBackend!=FrameGenerationBackend::Vfg)active.fgFixedTarget=defaults.fgFixedTarget;
         if(!color.enabled)active.color=defaults.color;
         for(size_t i=0;i<active.additionalColors.size();++i)
             if(i>=additionalColorCount||!additionalColors[i].enabled)active.additionalColors[i]={};
@@ -654,6 +670,9 @@ struct EnhancementSettings {
         active.captureFlipVertical=target.captureFlipVertical;active.exportBitrateMbps=target.exportBitrateMbps;
         // Read by the engine loop each pair; no graph update or NR history reset.
         active.fgAdaptive=target.fgAdaptive;active.pacingRepair=target.pacingRepair;
+        // Fixed target is planned per pair from PlayerOptions; the graph only sized
+        // its generated pool at build time.
+        active.fgFixedTarget=target.fgFixedTarget;
         if(isCaptureHalfRate(active.content)&&isCaptureHalfRate(target.content))active.content=target.content;
         return active==target;
     }
@@ -671,6 +690,9 @@ struct EnhancementSettings {
         // Adaptive multiplier and pacing repair: chosen per pair inside the running graph.
         video.fgAdaptive=target.fgAdaptive;
         video.pacingRepair=target.pacingRepair;
+        // Fixed target: the rate and the smoothing knobs are per-pair values too. The
+        // mode and the run cap decide how many generated slots exist, so they stay.
+        if(fixedTargetSameStructure(video.fgFixedTarget,target.fgFixedTarget))video.fgFixedTarget=target.fgFixedTarget;
         // Half-rate variants use the same graph and differ only at sample admission.
         if(isCaptureHalfRate(video.content)&&isCaptureHalfRate(target.content))video.content=target.content;
         // Colour grade: parameters are uniform-only (never a rebuild), but the

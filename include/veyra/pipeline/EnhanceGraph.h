@@ -1,5 +1,6 @@
 #pragma once
 #include "veyra/engine/EffectChain.h"
+#include "veyra/engine/FixedTargetSchedule.h"
 #include <optional>
 #include "veyra/engine/BackendRecovery.h"
 #include "veyra/pipeline/ColorGradeTables.h"
@@ -154,6 +155,10 @@ struct EnhanceGraphDesc {
     // its result is the source (as for the Video Effects families).
     bool firstSrRuns(uint32_t quality)const{return dualSr&&videoSrQuality==quality&&firstSrEnlarges();}
     uint32_t fgMultiplier=2;
+    // Fixed-target scheduling (engine/FixedTargetSchedule.h). Only VFG uses it, and
+    // only to size the generated slots: vfgSlotCount() is the larger of this
+    // pair's multiplier and the ticks a pair can ask for.
+    engine::FixedTargetConfig fgFixedTarget{};
     engine::FrameGenerationBackend frameGenerationBackend=engine::FrameGenerationBackend::Dlss;
     uint32_t vfgQuality=1;
     bool vfgAsyncSubmission=false; // preview-only; export retains synchronous SDK verdicts
@@ -655,7 +660,12 @@ public:
     // an independent command ring only. Must not re-enter process, reset,
     // timing collection, or structural/settings mutation. Resolving an old
     // lease's status and recording its consumer fence are allowed. Never retained.
-    bool process(const AVFrame* frame, double ptsMs, bool reset, FrameOutputs& out, uint64_t sourceFrameId = 0, const ColorDescription* color = nullptr, const HardwareSurfaceInput* hardwareSurface = nullptr, bool retainReferences = true, const FgAdmission& admitFg = {}, unsigned previewMultiplier = 0, bool pausedResidualRefresh = false, const std::function<void()>& previewCheckpoint = {}, const AVFrame* doviEl = nullptr, const DoviP7Constants* doviP7 = nullptr);
+    // fixedPlan: fixed-target scheduling for THIS pair (engine/FixedTargetSchedule.h).
+    // Non-null means the caller planned the pair on the output grid: the generated
+    // frames are the ticks inside (A,B) at their own t (VFG explicit timestep) and
+    // the real frame is submitted at the next grid point. Null keeps multiplier
+    // mode, which is the only mode every other backend supports.
+    bool process(const AVFrame* frame, double ptsMs, bool reset, FrameOutputs& out, uint64_t sourceFrameId = 0, const ColorDescription* color = nullptr, const HardwareSurfaceInput* hardwareSurface = nullptr, bool retainReferences = true, const FgAdmission& admitFg = {}, unsigned previewMultiplier = 0, bool pausedResidualRefresh = false, const std::function<void()>& previewCheckpoint = {}, const AVFrame* doviEl = nullptr, const DoviP7Constants* doviP7 = nullptr, const engine::FixedTargetPlan* fixedPlan = nullptr);
     bool nextFrameSlotAvailable()const {
         const unsigned slot=unsigned(realFrameIndex_%2);
         if(presentationFences_[slot]&&presentationFences_[slot]->GetCompletedValue()<presentationValues_[slot])return false;
@@ -1231,7 +1241,13 @@ private:
     bool initHudLock();
     std::unique_ptr<HudProtect> hudProtect_;
     bool initHudProtect();
-    void composeHudProtect(ID3D12GraphicsCommandList*,unsigned slot,unsigned parity,unsigned subframe,unsigned multiplier);
+    // usePrevious: the HUD comes from the previous real frame. Multiplier mode
+    // derives it from the subframe index, fixed-target mode from the tick's t.
+    void composeHudProtect(ID3D12GraphicsCommandList*,unsigned slot,unsigned parity,unsigned subframe,bool usePrevious);
+    // Generated slots per parity. Multiplier mode needs M-1; fixed target needs one
+    // per grid tick, so the graph and VFG are built with the larger of the two
+    // (engine::fixedTargetCapacity).
+    unsigned vfgSlotCount()const;
     void composeHudLock(ID3D12GraphicsCommandList* list,unsigned generatedSlot,unsigned heldParity,bool useNewerHud);
     std::unique_ptr<gfx::FsrSrBackend> fsrSrBackend_;
     // Double SR first passes on DLSS SR / FSR (the final pass keeps the members above).

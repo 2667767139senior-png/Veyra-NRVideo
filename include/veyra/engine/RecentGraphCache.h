@@ -30,6 +30,10 @@ public:
     ~RecentGraphCache(){evict("source-close");}
     static Key key(EnhancementSettings settings,std::optional<ChainRuntimeOrder> order,const pipeline::EnhanceGraphDesc& desc){
         settings.revision=0;
+        // Only an effects-off graph is ever retained (eligible() below), so a
+        // frame-generation knob cannot describe it: tuning the fixed-target rate
+        // must not evict a graph that never reads it.
+        settings.fgFixedTarget={};
         Key result{std::move(settings),std::move(order),desc.sourceWidth,desc.sourceHeight,desc.workWidth,desc.workHeight,
             desc.nrWidth,desc.nrHeight,desc.hdrInput,desc.hdrOutput,desc.rgbInput,desc.captureBitDepth,desc.packedInput,desc.yuy2Input,desc.runtimeAbsPath};
         auto module=std::filesystem::path(desc.runtimeAbsPath);

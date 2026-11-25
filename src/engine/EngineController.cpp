@@ -31,6 +31,7 @@
 #include "veyra/engine/CaptureReconnectBudget.h"
 #include "veyra/engine/DisplayFgBudget.h"
 #include "veyra/engine/AdaptiveFgMultiplier.h"
+#include "veyra/engine/FixedTargetSchedule.h"
 #include "veyra/engine/FramePacingRepair.h"
 #include "veyra/source/MediaFileSource.h"
 #include "veyra/source/CaptureCardSource.h"
@@ -1409,6 +1410,11 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             double vfgChosenFgMs=0,vfgFastFgMs=0;uint64_t vfgFastPairs=0,vfgFastBudgetPairs=0,vfgChosenPairs=0;int64_t vfgChosenAt=0,nextVfgFastLog=0;
             uint64_t generatedDropDeadline=0,generatedDropCapacity=0,generatedDropCap=0;
             LivePairLatency pairLatency;
+            // Fixed-target VFG scheduling (engine/FixedTargetSchedule.h): one plan per
+            // accepted pair, on the deduplicated content clock. Configured from the
+            // settings; disabled leaves every path below exactly as it was.
+            FixedTargetScheduler fixedTarget;
+            uint64_t nextFixedTargetLog=0;
             // Capture-card FG pairs: automatic deadline margin (0-1 ms) on top of the phase.
             LiveDeadlineMargin deadlineMargin;
             // Capture-card FG pairs rejected for a second: real frames without the FG phase.
@@ -1608,7 +1614,16 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     if(currentCost)fgBudget.complete(watch.gpuExecutionMs,batch.fgEvaluated>0,batch.historyReset||batch.fgRecovery||costSettling,host100ns(),watch.fgExecutionMs,!batch.fgReduced&&!batch.fgFast);
                     if(options.settings.frameGenerationBackend==FrameGenerationBackend::Vfg&&currentCost){
                         if(batch.historyReset)vfgOverload.reset();
-                        if(!batch.historyReset&&!batch.fgRecovery&&!batch.fgReduced&&batch.fgEvaluated+1==options.fgMultiplier)
+                        // "The whole group ran" is the user's M-1 in multiplier mode, and
+                        // the plan's own candidate count under fixed target, where the
+                        // group is whatever number of grid ticks this pair covered. The
+                        // sample stays the group's GPU time either way: that is what the
+                        // deadline comparison below wants to know.
+                        const bool fixedTargetFg=options.settings.fgFixedTarget.enabled;
+                        const bool wholeGroup=fixedTargetFg?
+                            batch.fgCandidates>0&&batch.fgEvaluated==batch.fgCandidates:
+                            batch.fgEvaluated+1==options.fgMultiplier;
+                        if(!batch.historyReset&&!batch.fgRecovery&&!batch.fgReduced&&wholeGroup)
                             vfgOverload.observe(watch.fgExecutionMs,watch.firstFgExecutionMs,host100ns());
                     }
                     // A group whose frames were all evaluated but then marked a content
@@ -3175,6 +3190,32 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         previewFgMultiplier=std::clamp(needed,2u,options.fgMultiplier);
                     }
                 }
+                // Fixed target (engine/FixedTargetSchedule.h): plan this pair on the output
+                // grid before anything reads previewFgMultiplier, because the graph, the
+                // admission budget and the capacity wait all take the per-pair group size
+                // from it. VFG only - it is the one backend with an explicit-timestep mode -
+                // and the plan carries the bypass cases (a stall, a source already at the
+                // target rate) as count=0, which makes the graph generate nothing for that
+                // pair instead of M-1 frames in the middle of it.
+                FixedTargetPlan fixedPlan;
+                const FixedTargetPlan* fixedPlanPtr=nullptr;
+                const bool fixedEligible=options.fg&&options.settings.fgFixedTarget.enabled&&
+                    options.settings.frameGenerationBackend==FrameGenerationBackend::Vfg&&
+                    !isImage&&!presentSinkFrameGeneration(options.settings.frameGenerationBackend);
+                // The mode, the rate and the smoothing knobs cannot be read from the
+                // settings revision: they are exempt from the rebuild comparison, so
+                // editing them mid-play does NOT bump it. Compare the struct instead;
+                // configure() re-anchors the grid only when the period actually
+                // changes, so an unrelated edit does not restart the output clock.
+                if(!(fixedTarget.config()==options.settings.fgFixedTarget))fixedTarget.configure(options.settings.fgFixedTarget);
+                if(fixedEligible){
+                    if(std::isfinite(lastProcessedPtsMs)&&pts>lastProcessedPtsMs)
+                        fixedPlan=fixedTarget.plan(int64_t(std::llround(lastProcessedPtsMs*10000.0)),
+                                                   int64_t(std::llround(pts*10000.0)),pairContentFps);
+                    else{fixedPlan.realPts100ns=int64_t(std::llround(pts*10000.0));fixedPlan.bypass=true;fixedPlan.reason="firstPair";}
+                    previewFgMultiplier=std::max(2u,fixedPlan.count+1);
+                    fixedPlanPtr=&fixedPlan;
+                }
                 // Live output hint: the panel cannot show more than one new picture
                 // per refresh, so suggest a multiplier that fits (DisplayFgBudget.h).
                 // The multiplier stays the user's choice (2026-10-14: hint, never
@@ -3285,7 +3326,10 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         if(adjustPhase&&!admitted)pairLatency.observe(now,neededPhase);
                         logAdmission(batch,now,deadline,elapsed,presentP95,admitted,warmingHistory,pairAnchoredLive?(isStream?"decoded-pair":"capture-pair"):"continuous");
                         auto decision=admitted?pipeline::EnhanceGraph::FgDecision::Evaluate:pipeline::EnhanceGraph::FgDecision::Skip;
-                        if(smoothTransportAnchor&&options.settings.vfgAutoRegulate&&previewFgMultiplier==2&&!warmingHistory&&graph->vfgFastReady()){
+                        // Fixed target paces the output itself and its group is the plan's
+                        // tick count, not a fixed M-1: the 2X fast-model shortcut below
+                        // reads a per-group cost that no longer means one refresh.
+                        if(!fixedPlanPtr&&smoothTransportAnchor&&options.settings.vfgAutoRegulate&&previewFgMultiplier==2&&!warmingHistory&&graph->vfgFastReady()){
                             const double base=fgBudget.baseCost(now).value_or(0),progress=std::clamp(elapsed,0.0,base),blit=std::max(0.0,presentP95);
                             if(!admitted){
                                 if(double(deadline-now)/10000+10>=std::max(0.0,base+vfgFastFgMs-progress)+blit)decision=pipeline::EnhanceGraph::FgDecision::FastForBudget;
@@ -3413,13 +3457,21 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     {OnExit processingDone{[&]{processingGraph=false;}};
                     // The first checkpoint: a frame due before the graph's first one.
                     if(!historyReset)presentDuringProcess();
-                    processed=!injectedReject&&graph->process(frame,pts,historyReset,out,pkt.sequence,&pkt.colorInfo,&pkt.hardwareSurface,comparisonMode_!=0,admitFg,previewFgMultiplier,(paused_||isImage)&&transaction,presentDuringProcess,pkt.doviEl,&pkt.doviP7);}
+                    processed=!injectedReject&&graph->process(frame,pts,historyReset,out,pkt.sequence,&pkt.colorInfo,&pkt.hardwareSurface,comparisonMode_!=0,admitFg,previewFgMultiplier,(paused_||isImage)&&transaction,presentDuringProcess,pkt.doviEl,&pkt.doviP7,fixedPlanPtr);}
                     presenter->endReflex(currentReflexFrame);
                     processSlotWaitMs=ring.cpuWaitMilliseconds()-processWaitMsBase;
                 }
                 loopTrace.mark("graphSubmit");
                 previewSkipSinceProcess=false;
                 if(processed)lastProcessedPtsMs=pts;
+                if(processed&&fixedPlanPtr&&host100ns()>=nextFixedTargetLog){
+                    nextFixedTargetLog=host100ns()+10000000;
+                    const auto& st=fixedTarget.stats();
+                    veyra::log::info("fixed-target",std::format("revision={} targetFps={:.2f} contentFps={:.2f} sourceMs={:.3f} smoothedMs={:.3f} ticks={} realGridDelayMs={:.3f} bypass={} reason={} intervals={} ticksTotal={} dropped={} bypassLong={} bypassAtTarget={} resyncs={} (output clock 1/targetFps on the content clock; ticks = generated frames inside this pair, realGridDelayMs = how far B moved onto the grid, bypass = the pair ran as-is)",
+                        options.settings.revision,options.settings.fgFixedTarget.targetFps,pairContentFps,st.lastSpanMs,st.lastSmoothedSpanMs,
+                        fixedPlanPtr->count,double(fixedPlanPtr->realPts100ns-int64_t(std::llround(pts*10000.0)))/10000.0,
+                        fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.ticks,st.droppedByCap,st.bypassLong,st.bypassAtTarget,st.resyncs));
+                }
                 if(!processed){
                     const auto failedComponent=graph->failedBackend();
                     const bool retryVfgLow=failedComponent==FailedBackend::Fg&&usesVfgMedium(options.snapshot())&&graph->vfgAdaMediumMemoryFault();

@@ -163,6 +163,9 @@ inline pipeline::ResolutionPlan describeStages(const StageRequest& request,const
         ? exportFrameGenerationSupported(settings.frameGenerationBackend,request.nvidiaAdapter)
         : request.nvidiaAdapter||crossVendorFrameGeneration(settings.frameGenerationBackend));
     desc.fgMultiplier=request.fgMultiplier;
+    // Fixed target only sizes the generated pool, and only for VFG; the schedule
+    // itself arrives per pair (engine/FixedTargetSchedule.h).
+    desc.fgFixedTarget=settings.effectiveFixedTarget();
     desc.videoSrQuality=currentVideoSrQuality(settings.videoSrQuality);
     desc.dlssSrModel=settings.dlssSrModel;
     describeNrLayers(settings,desc);

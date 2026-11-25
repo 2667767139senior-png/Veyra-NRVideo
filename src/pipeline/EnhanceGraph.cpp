@@ -908,8 +908,8 @@ bool EnhanceGraph::initialize(const EnhanceGraphDesc& desc)
         const auto extent=desc_.nrFullExtent(target);interProtectionBytes=uint64_t(extent.width)*extent.height*8;
     }
     const bool vfg=fgEnabled_&&desc_.frameGenerationBackend==engine::FrameGenerationBackend::Vfg;
-    const uint64_t vfgSharedBytes=vfg?uint64_t((workW_*4u+255u)&~255u)*workH_*(2u+2u*(desc_.fgMultiplier-1u)):0;
-    const unsigned generatedTextures=fgEnabled_?(fsrEnabled()?2u:vfg?2u*(desc_.fgMultiplier-1u):10u):0;
+    const uint64_t vfgSharedBytes=vfg?uint64_t((workW_*4u+255u)&~255u)*workH_*(2u+2u*(vfgSlotCount()-1u)):0;
+    const unsigned generatedTextures=fgEnabled_?(fsrEnabled()?2u:vfg?2u*(vfgSlotCount()-1u):10u):0;
     // Constant depth / zero motion for the temporal SR passes: the source extent
     // for a single FSR pass, the largest DLSS SR / FSR input or motion extent of
     // a double SR (a first DLSS pass takes motion at its result, a second DLSS
@@ -1256,7 +1256,7 @@ bool EnhanceGraph::createResources()
     for(size_t i=0;i<kGeneratedPoolSlots;++i){
         // DLSS compatibility binds ten full-sized resources even at 2X.
         // VFG owns only the selected multiplier's outputs; FSR owns one pair.
-        const unsigned usedCount=fsrEnabled()?2u:desc_.frameGenerationBackend==engine::FrameGenerationBackend::Vfg||desc_.frameGenerationBackend==engine::FrameGenerationBackend::Rife?2u*(desc_.fgMultiplier-1u):10u;
+        const unsigned usedCount=fsrEnabled()?2u:desc_.frameGenerationBackend==engine::FrameGenerationBackend::Vfg||desc_.frameGenerationBackend==engine::FrameGenerationBackend::Rife?2u*(vfgSlotCount()-1u):10u;
         const bool used=fgEnabled_&&i<usedCount;
         genFrame_[i]=makeTexture(context_.device(),used?workW_:1,used?workH_:1,outputFormat(),true);
         if(!genFrame_[i])return false;
@@ -1789,12 +1789,16 @@ ID3D12Resource* EnhanceGraph::hudProtectionCounters(unsigned slot) const {
     return hudProtect_?hudProtect_->counters(slot%2):nullptr;
 }
 
+// usePrevious: the HUD pixels come from the previous real frame instead of the
+// current one. Multiplier mode decides it by the subframe index (sub*2 <= M, the
+// old inline rule); fixed-target mode by the tick's t, because its subframes are
+// not evenly spaced.
 void EnhanceGraph::composeHudProtect(ID3D12GraphicsCommandList* list,unsigned slot,unsigned parity,
-                                     unsigned subframe,unsigned multiplier) {
+                                     unsigned subframe,bool usePrevious) {
     if(!hudProtect_)return;
     const auto stage=GpuStage(unsigned(GpuStage::HudCompose1)+subframe-1);
     gpuTimer_.mark(list,stage);
-    hudProtect_->compose(list,tracker_,slot,genFrame_[slot].Get(),parity,subframe*2<=multiplier?1-parity:parity);
+    hudProtect_->compose(list,tracker_,slot,genFrame_[slot].Get(),parity,usePrevious?1-parity:parity);
     gpuTimer_.mark(list,stage,true);
 }
 
@@ -1815,12 +1819,19 @@ void EnhanceGraph::composeHudLock(ID3D12GraphicsCommandList* list,unsigned gener
         veyra::log::warn("hud-lock",std::format("compose skipped slot={} held={}",generatedSlot,heldParity));
 }
 
+// Generated slots per parity, expressed as the multiplier whose M-1 slots they are.
+// Fixed target can ask for one run per grid tick, so the graph and VFG are built
+// with engine::fixedTargetCapacity; multiplier mode keeps the requested M.
+unsigned EnhanceGraph::vfgSlotCount() const {
+    return engine::fixedTargetCapacity(desc_.fgFixedTarget,desc_.fgMultiplier);
+}
+
 bool EnhanceGraph::initVfg()
 {
     if(!fgEnabled_||desc_.frameGenerationBackend!=engine::FrameGenerationBackend::Vfg)return true;
     failedBackend_=engine::FailedBackend::Fg;
     vfgBackend_=std::make_unique<VfgBackend>();
-    if(!vfgBackend_->initialize(context_,desc_.runtimeAbsPath,workW_,workH_,outputFormat(),desc_.fgMultiplier,desc_.vfgQuality,desc_.vfgAsyncSubmission,desc_.vfgFastFallback))return false;
+    if(!vfgBackend_->initialize(context_,desc_.runtimeAbsPath,workW_,workH_,outputFormat(),vfgSlotCount(),desc_.vfgQuality,desc_.vfgAsyncSubmission,desc_.vfgFastFallback))return false;
     fgCapsAvailable_=true;fgMultiFrameMax_=int(FrameBatch::Capacity)-1;
     return true;
 }
@@ -3142,7 +3153,7 @@ void EnhanceGraph::composeExclusion(ID3D12GraphicsCommandList* list,unsigned out
     if(ui)tracker_.transition(list,exclusionUi_[rawParity].Get(),common);
 }
 
-bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, FrameOutputs& out, uint64_t sourceFrameId, const ColorDescription* color, const HardwareSurfaceInput* hardwareSurface, bool retainReferences, const FgAdmission& admitFg, unsigned previewMultiplier, bool pausedResidualRefresh, const std::function<void()>& previewCheckpoint, const AVFrame* doviEl, const DoviP7Constants* doviP7)
+bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, FrameOutputs& out, uint64_t sourceFrameId, const ColorDescription* color, const HardwareSurfaceInput* hardwareSurface, bool retainReferences, const FgAdmission& admitFg, unsigned previewMultiplier, bool pausedResidualRefresh, const std::function<void()>& previewCheckpoint, const AVFrame* doviEl, const DoviP7Constants* doviP7, const engine::FixedTargetPlan* fixedPlan)
 {
     doviElFrame_ = doviEl;   // Custom (P5): borrowed for this frame only
     p7Ready_ = doviP7 != nullptr && doviP7->ready;
@@ -4570,7 +4581,14 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     previousSource_=sourceFrameId;
     const bool fgBackendAvailable=fgEnabled_&&fgCreated();
     const unsigned fgMultiplier=previewMultiplier&&fgBackendAvailable?std::clamp(previewMultiplier,2u,desc_.fgMultiplier):desc_.fgMultiplier;
-    out.fgCandidates=fgBackendAvailable?fgMultiplier-1:0;
+    // Fixed-target (engine/FixedTargetSchedule.h): the caller planned this pair on
+    // the output grid, so fgCalls is the number of grid positions inside (A,B) -
+    // possibly zero - and every generated frame carries its grid timestamp. The
+    // plan is only ever supplied for the VFG backend, whose explicit-timestep mode
+    // takes an arbitrary t; every other backend keeps the multiplier path.
+    const bool fixedTarget=fixedPlan!=nullptr&&vfgBackend_!=nullptr&&fgBackendAvailable;
+    const unsigned fixedTicks=fixedTarget?std::min<unsigned>(fixedPlan->count,vfgSlotCount()-1u):0u;
+    out.fgCandidates=fgBackendAvailable?(fixedTarget?fixedTicks:fgMultiplier-1):0;
     bool resetFg=reset||!prevValid_||fgHistorySkipped_;
     const bool historyValid=!resetFg;
     // VEYRA_TEST_VFG_SKIP_RESETS_HISTORY=1 restores the pre-2026-10-10 rule
@@ -4594,8 +4612,8 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     out.fgFastForBudget=out.fgFast&&decision==FgDecision::FastForBudget;
     // A reset has no usable A/B pair. Seed one complete 2X evaluation group;
     // all later subframes would repeat reset work and cannot be presented.
-    const uint32_t fgCalls=(resetFg||reduced)?1:fgMultiplier-1;
-    const unsigned outputMultiplier=reduced?2u:fgMultiplier;
+    const uint32_t fgCalls=(resetFg||reduced)?1:(fixedTarget?fixedTicks:fgMultiplier-1);
+    const unsigned outputMultiplier=reduced?2u:(fixedTarget?std::max(fgMultiplier,fixedTicks+1):fgMultiplier);
     if(runFg&&resetFg){
         if(reseedRejected)out.fgSkippedBeforeEval=out.fgCandidates-fgCalls;
         else out.fgSkippedForReset=out.fgCandidates-fgCalls;
@@ -4649,10 +4667,28 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     out.videoFenceObject = ring_->fence();
 
     // FG reads enhanced SDR color, not the pre-NR guidance input.
+    // Fixed-target helpers: t and the grid timestamp of subframe `sub`. A reset
+    // or a budget-reduced group runs one frame at the first planned tick, so its
+    // position and timestamp still belong to this pair's grid.
+    auto tickTimestep=[&](uint32_t sub)->double{
+        return fixedTarget&&sub>=1&&sub-1<fixedPlan->count?fixedPlan->t[sub-1]:0.5;};
+    auto tickPts=[&](uint32_t sub)->int64_t{
+        if(fixedTarget&&sub>=1&&sub-1<fixedPlan->count)return fixedPlan->pts100ns[sub-1];
+        return FrameBatch::interpolate(out.batch.a100ns,out.batch.b100ns,sub,outputMultiplier);};
+    // The mixed tier's chosen model goes to the tick nearest the middle of the
+    // interval, where interpolation is hardest (vfgPrimarySubframe, by t).
+    int fixedPrimary=0;
+    if(fixedTarget&&fixedTicks){
+        double best=2.0;
+        for(unsigned i=0;i<fixedTicks;++i){
+            const double distance=std::abs(fixedPlan->t[i]-0.5);
+            if(distance<best-1e-9){best=distance;fixedPrimary=int(i)+1;}
+        }
+    }
     if (runFg && fgCreated()) {
       for(uint32_t sub=1;sub<=fgCalls;++sub){
         const uint32_t generatedSlot=parity+(sub-1)*2;
-        const bool useNewerHud=!resetFg&&sub*2>outputMultiplier;
+        const bool useNewerHud=!resetFg&&(fixedTarget?tickTimestep(sub)>0.5:sub*2>outputMultiplier);
         if(amfFrc_){
             // GPU producer -> AMF FRC on its own queue -> GPU consumer, ordered by
             // AMF's texture fences (queue waits, no CPU wait). One frame per pair.
@@ -4662,7 +4698,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             const bool copied=amfFrc_->copyOutput(flist,genFrame_[generatedSlot].Get());
             if(!copied&&!resetFg){veyra::log::error("amf-frc","AMF returned no interpolated frame for this pair");failedBackend_=engine::FailedBackend::Fg;return false;}
             composeHudLock(flist,generatedSlot,resetFg?parity:1-parity,useNewerHud);
-            if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,outputMultiplier);
+            if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,!useNewerHud);
             composeExclusion(flist,generatedSlot+2,resetFg?parity:1-parity,false,true);
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COMMON);
             gpuTimer_.mark(flist,GpuStage::Fg1,true);gpuTimer_.mark(flist,GpuStage::FgBatch,true);gpuTimer_.resolve(flist);
@@ -4690,7 +4726,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             if(!rife_->copyOutput(flist,genFrame_[generatedSlot].Get(),sub,outputMultiplier)){failedBackend_=engine::FailedBackend::Fg;return false;}
             composeHudLock(flist,generatedSlot,1-parity,useNewerHud);
-            if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,outputMultiplier);
+            if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,!useNewerHud);
             composeExclusion(flist,generatedSlot+2,1-parity,false,true);
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COMMON);
             const bool last=sub==fgCalls;
@@ -4711,12 +4747,20 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         if(vfgBackend_){
             // GPU producer -> CUDA interpolation -> GPU consumer. No per-frame
             // CPU fence waits/readback; the bounded command ring owns reuse.
-            if(!vfgBackend_->generate(parity,sub,resetFg?2u:outputMultiplier,resetFg,out.fgFast)){failedBackend_=engine::FailedBackend::Fg;return false;}
+            // Fixed-target passes the tick's own t through VFG's explicit-timestep
+            // mode (FrameMultiplier=0), which is why sub only picks the output
+            // buffer there. A mixed tier's chosen model follows t instead of the
+            // subframe index; a single-model tier keeps the automatic choice so
+            // fastReady() can still repair an overloaded pair.
+            const int primaryHint=fixedTarget&&engine::vfgMixedQuality(desc_.vfgQuality)?
+                int(sub==uint32_t(fixedPrimary)):-1;
+            if(!vfgBackend_->generate(parity,sub,resetFg?2u:outputMultiplier,resetFg,out.fgFast,
+                    fixedTarget?tickTimestep(sub):0.0,primaryHint)){failedBackend_=engine::FailedBackend::Fg;return false;}
             auto* flist=ring_->acquireNext(slot,st);if(!flist)return false;
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COPY_DEST);
             if(!vfgBackend_->copyOutput(flist,genFrame_[generatedSlot].Get(),generatedSlot)){failedBackend_=engine::FailedBackend::Fg;return false;}
             composeHudLock(flist,generatedSlot,resetFg?parity:1-parity,useNewerHud);
-            if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,outputMultiplier);
+            if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,!useNewerHud);
             composeExclusion(flist,generatedSlot+2,resetFg?parity:1-parity,false,true);
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COMMON);
             const auto timingStage=GpuStage(unsigned(GpuStage::Fg1)+sub-1);gpuTimer_.mark(flist,timingStage,true);
@@ -4727,11 +4771,12 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             // VFG work is already submitted here; an older frame due now goes out.
             if(previewCheckpoint&&!reset)previewCheckpoint();
             ++out.fgEvaluated;out.hasGenerated=!resetFg;out.genSlot=parity;
-            out.genFenceValue=ring_->lastSignaledValue();out.genFenceObject=ring_->fence();out.generatedPtsMs=(prevPtsMs_+ptsMs)*0.5;
+            out.genFenceValue=ring_->lastSignaledValue();out.genFenceObject=ring_->fence();
+            out.generatedPtsMs=fixedTarget?(prevPtsMs_+(ptsMs-prevPtsMs_)*tickTimestep(sub)):(prevPtsMs_+ptsMs)*0.5;
             if(out.hasGenerated){
                 ++metrics_.fgSubmittedCandidates;
                 BatchFrame f;f.identity=out.batch.identity;f.kind=FrameKind::Generated;f.validity=GenerationValidity::Pending;f.subframe=sub;
-                f.pts100ns=FrameBatch::interpolate(out.batch.a100ns,out.batch.b100ns,sub,outputMultiplier);
+                f.pts100ns=tickPts(sub);
                 f.lease=std::make_shared<FrameLease>();f.lease->texture=genFrame_[generatedSlot];f.lease->slot=generatedSlot;
                 f.lease->readyFence=out.genFenceValue;f.lease->readyFenceObject=out.genFenceObject;generatedLeases_[generatedSlot]=f.lease;out.batch.append(std::move(f));
             }
@@ -4800,7 +4845,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         flist->CopyBufferRegion(fgDisableReadback_[generatedSlot].Get(),0,fgDisable_[parity].Get(),0,4);
         }
         composeHudLock(flist,generatedSlot,resetFg?parity:1-parity,useNewerHud);
-        if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,outputMultiplier);
+        if(!resetFg)composeHudProtect(flist,generatedSlot,parity,sub,!useNewerHud);
         composeExclusion(flist,generatedSlot+2,resetFg?parity:1-parity,false,true);
         tracker_.transition(flist,fgFrame,D3D12_RESOURCE_STATE_COMMON);
         tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COMMON);
@@ -4836,7 +4881,11 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     ++realFrameIndex_;
     out.realFrameIndex = realFrameIndex_;
     out.videoSlot = parity;
-    BatchFrame real;real.identity=out.batch.identity;real.pts100ns=out.batch.b100ns;real.lease=std::make_shared<FrameLease>();real.lease->texture=exclusionVideo_[parity]?exclusionVideo_[parity]:videoFrame_[parity];real.lease->sourceReference=sourceReferences_[parity];real.lease->baseReference=baseReferences_[parity];real.lease->slot=parity;real.lease->readyFence=out.videoFenceValue;real.lease->readyFenceObject=out.videoFenceObject;real.lease->referencesValid=retainReferences;realLeases_[parity]=real.lease;out.batch.append(std::move(real));
+    // Fixed-target: the real frame is submitted on the output grid, one period
+    // after the last generated tick, so the panel never sees a gap that only
+    // exists because B arrived off-grid (engine/FixedTargetSchedule.h).
+    const int64_t realPts=fixedTarget?std::max(fixedPlan->realPts100ns,out.batch.b100ns):out.batch.b100ns;
+    BatchFrame real;real.identity=out.batch.identity;real.pts100ns=realPts;real.lease=std::make_shared<FrameLease>();real.lease->texture=exclusionVideo_[parity]?exclusionVideo_[parity]:videoFrame_[parity];real.lease->sourceReference=sourceReferences_[parity];real.lease->baseReference=baseReferences_[parity];real.lease->slot=parity;real.lease->readyFence=out.videoFenceValue;real.lease->readyFenceObject=out.videoFenceObject;real.lease->referencesValid=retainReferences;realLeases_[parity]=real.lease;out.batch.append(std::move(real));
     if(veyra::log::verboseFrameLogs())veyra::log::info("frame-batch",std::format("batch={} epoch={} revision={} source={} a={} b={} count={} realSlot={} realFence={} genSlot={} genFence={}",out.batch.batchId,epoch_,out.batch.identity.settingsRevision,out.batch.identity.sourceFrameId,out.batch.a100ns,out.batch.b100ns,out.batch.count,parity,out.videoFenceValue,out.genSlot,out.genFenceValue));
     if(pausedEligible&&lastAppliedSettings_){
         pausedNrCacheValid_=true;pausedNrFrame_=frame;pausedNrSourceId_=sourceFrameId;pausedNrPts_=ptsMs;
@@ -4951,8 +5000,11 @@ bool EnhanceGraph::applySettings(const engine::EnhancementSettings& s){
     // DLSS allocates multiplier-specific feature/output resources.
     // XeSS has a fixed 2X proxy swapchain contract. Settings callers must
     // rebuild instead of accepting a change that cannot take effect in place.
+    // Fixed target sizes the generated pool, so a new run cap (or turning the mode
+    // on/off) is a rebuild; the rate and the smoothing knobs are per-pair values.
+    const unsigned requestedSlots=engine::fixedTargetCapacity(s.effectiveFixedTarget(),std::max(2u,s.multiplier));
     if((desc_.enableNr&&s.nrRuntime!=desc_.nrRuntime)||
-       (desc_.enableFg&&(std::max(2u,s.multiplier)!=desc_.fgMultiplier||s.frameGenerationBackend!=desc_.frameGenerationBackend||
+       (desc_.enableFg&&(requestedSlots!=vfgSlotCount()||s.frameGenerationBackend!=desc_.frameGenerationBackend||
         (desc_.frameGenerationBackend==engine::FrameGenerationBackend::Vfg&&(s.vfgQuality!=desc_.vfgQuality||s.vfgAutoRegulate!=desc_.vfgAutoRegulate))))||
        (desc_.enableSr&&(engine::currentVideoSrQuality(s.videoSrQuality)!=desc_.videoSrQuality||
          ((desc_.videoSrQuality==0||(desc_.dualSr&&desc_.dualSrQuality==0))&&s.dlssSrModel!=desc_.dlssSrModel)))||
@@ -5070,6 +5122,9 @@ bool EnhanceGraph::applySettings(const engine::EnhancementSettings& s){
         // leave both the parameters and the history untouched.
         ++layer.inputRevision;
     }
+    // desc_.fgMultiplier keeps the user's M (the present sink and the export job read
+    // it); the fixed-target pool size is derived from these two by vfgSlotCount().
+    desc_.fgFixedTarget=s.effectiveFixedTarget();
     desc_.fgMultiplier=std::max(2u,s.multiplier);
     const bool temporalMotion=s.usesNrTemporal();
     desc_.enableNvofStandalone=s.nr&&!desc_.stillImage&&(desc_.nrUsesFlow()||temporalMotion);nvofStandalone_=desc_.enableNvofStandalone;

@@ -83,6 +83,9 @@ struct VfgBackend::Impl {
     int (__cdecl* create)(const char*,void**)=nullptr;
     void (__cdecl* destroy)(void*)=nullptr;
     int (__cdecl* setU32)(void*,const char*,unsigned)=nullptr;
+    // Explicit timestep mode (VideoFrameGeneration: NVVFXVIDEOFRAMEGENERATION_TIMESTEP
+    // is F32). Optional: an older core without it keeps multiplier mode only.
+    int (__cdecl* setF32)(void*,const char*,float)=nullptr;
     int (__cdecl* setImage)(void*,const char*,void*)=nullptr;
     int (__cdecl* setStream)(void*,const char*,CUstream)=nullptr;
     int (__cdecl* loadEffect)(void*)=nullptr;
@@ -143,7 +146,7 @@ struct VfgBackend::Impl {
     Microsoft::WRL::ComPtr<ID3D12PipelineState> cutPso;
     Microsoft::WRL::ComPtr<ID3D12Resource> cutResults;
     D3D12_RESOURCE_STATES cutState=D3D12_RESOURCE_STATE_COMMON;
-    struct Job {unsigned parity,sub,multiplier;bool reset;uint64_t revision,value;bool fast;};
+    struct Job {unsigned parity,sub,multiplier;bool reset;uint64_t revision,value;bool fast;float timestep;int primary;};
     std::array<std::atomic<SubmissionState>,kOutputs> states{};
     std::atomic<bool> failed=false;
     std::atomic<bool> adaMemoryFault=false;
@@ -325,7 +328,7 @@ struct VfgBackend::Impl {
         buffer.resource.Reset();
     }
     bool cudaJob(const Job& job){
-        const auto [parity,sub,multiplier,reset,revision,value,fast]=job;
+        const auto [parity,sub,multiplier,reset,revision,value,fast,timestep,primary]=job;
         Current current(*this);if(!current.active)return false;
         CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS wait{};wait.params.fence.value=value;
         bool ok=!failed.load()&&cu(cpuCall(2,[&]{return cuWaitExternalSemaphoresAsyncFn(&inputSemaphore,&wait,1,stream);}),"cuWaitExternalSemaphoresAsync");
@@ -344,7 +347,8 @@ struct VfgBackend::Impl {
         if(sub==1||revision!=lastRevision||parity!=lastParity||reset!=lastReset){
             ++pairSerial;lastRevision=revision;lastParity=parity;lastReset=reset;
         }
-        const bool second=(mixed&&sub!=engine::vfgPrimarySubframe(multiplier))||(fast&&effects[1].handle);
+        const bool second=primary>=0?(primary==0&&effects[1].handle!=nullptr):
+            ((mixed&&sub!=engine::vfgPrimarySubframe(multiplier))||(fast&&effects[1].handle));
         auto& e=effects[second?1:0];
         if(ok&&e.boundPair!=pairSerial){
             ok=cv(cpuCall(3,[&]{return setImage(e.handle,"SrcImage0",inputs[reset?parity:1-parity].image);}),"SetImage previous")&&
@@ -352,12 +356,22 @@ struct VfgBackend::Impl {
                 cv(cpuCall(6,[&]{return setU32(e.handle,"ShotChange",reset?1u:0u);}),"SetU32 ShotChange");
             if(ok)e.boundPair=pairSerial;
         }
-        if(ok&&e.boundMultiplier!=multiplier){
-            ok=cv(cpuCall(7,[&]{return setU32(e.handle,"FrameMultiplier",multiplier);}),"SetU32 FrameMultiplier");
-            if(ok)e.boundMultiplier=multiplier;
+        // Explicit timestep mode is FrameMultiplier=0. Setting the multiplier, 0
+        // included, resets FrameIndex and Timestep, so the selector is written
+        // again for every run and only the multiplier is cached.
+        const bool timestepMode=timestep>0.0f;
+        const unsigned wantedMultiplier=timestepMode?0u:multiplier;
+        if(ok&&e.boundMultiplier!=wantedMultiplier){
+            ok=cv(cpuCall(7,[&]{return setU32(e.handle,"FrameMultiplier",wantedMultiplier);}),"SetU32 FrameMultiplier");
+            if(ok)e.boundMultiplier=wantedMultiplier;
         }
-        ok=ok&&cv(cpuCall(5,[&]{return setImage(e.handle,"DstImage0",outputs[parity+2*(sub-1)].image);}),"SetImage output")&&
-            cv(cpuCall(8,[&]{return setU32(e.handle,"FrameIndex",sub);}),"SetU32 FrameIndex");
+        ok=ok&&cv(cpuCall(5,[&]{return setImage(e.handle,"DstImage0",outputs[parity+2*(sub-1)].image);}),"SetImage output");
+        if(ok){
+            if(timestepMode){
+                if(!setF32){log::error("vfg","NvVFX_SetF32 unavailable; explicit timestep mode needs it");ok=false;}
+                else ok=cv(cpuCall(8,[&]{return setF32(e.handle,"Timestep",timestep);}),"SetF32 Timestep");
+            }else ok=cv(cpuCall(8,[&]{return setU32(e.handle,"FrameIndex",sub);}),"SetU32 FrameIndex");
+        }
         if(ok&&testRunDelayMs>0){
             const auto until=std::chrono::steady_clock::now()+std::chrono::duration<double,std::milli>(testRunDelayMs*(second?.3:1));
             while(std::chrono::steady_clock::now()<until)std::this_thread::yield();
@@ -443,13 +457,13 @@ struct VfgBackend::Impl {
             {std::lock_guard lock(jobsMutex);--outstanding;}
         }
     }
-    bool handoff(unsigned parity,unsigned sub,unsigned multiplier,bool reset,bool fast){
+    bool handoff(unsigned parity,unsigned sub,unsigned multiplier,bool reset,bool fast,float timestep,int primary){
         const unsigned slot=parity+2*(sub-1);
         if(!asynchronous){
             std::lock_guard submit(cudaSubmissionMutex);
             const uint64_t value=++signalValue;
             if(!hr(cpuCall(1,[&]{return context->directQueue()->Signal(producer.Get(),value);}),"signal VFG producer"))return false;
-            const bool ok=cudaJob({parity,sub,multiplier,reset,inputRevision,value,fast});
+            const bool ok=cudaJob({parity,sub,multiplier,reset,inputRevision,value,fast,timestep,primary});
             if(!ok){
                 failed.store(true);Current current(*this);
                 if(current.active&&stream)cu(cuStreamSynchronizeFn(stream),"rejected synchronous job drain");
@@ -476,7 +490,7 @@ struct VfgBackend::Impl {
         if(!hr(cpuCall(1,[&]{return context->directQueue()->Signal(producer.Get(),value);}),"signal VFG producer"))return false;
         // Allocate the queue entry before adding a GPU dependency. Even a host
         // allocation exception cannot leave a wait with no job to signal it.
-        jobs.push_back({parity,sub,multiplier,reset,inputRevision,value,fast});
+        jobs.push_back({parity,sub,multiplier,reset,inputRevision,value,fast,timestep,primary});
         if(!hr(cpuCall(11,[&]{return context->directQueue()->Wait(completion.Get(),value);}),"queue wait VFG completion")){
             jobs.pop_back();return false;
         }
@@ -588,6 +602,10 @@ bool VfgBackend::initialize(gfx::D3D12DeviceContext& context,const std::wstring&
     BIND_VFX(create,"NvVFX_CreateEffect");BIND_VFX(destroy,"NvVFX_DestroyEffect");BIND_VFX(setU32,"NvVFX_SetU32");BIND_VFX(setImage,"NvVFX_SetImage");
     BIND_VFX(setStream,"NvVFX_SetCudaStream");BIND_VFX(loadEffect,"NvVFX_Load");BIND_VFX(run,"NvVFX_Run");BIND_VFX(getVersion,"NvVFX_GetVersion");
 #undef BIND_VFX
+    // Optional: explicit timestep mode (fixed target). A core that does not export
+    // it keeps multiplier mode exactly as before and reports the feature missing.
+    p.setF32=reinterpret_cast<decltype(p.setF32)>(GetProcAddress(core,"NvVFX_SetF32"));
+    if(!p.setF32)log::info("vfg","NvVFX_SetF32 not exported; explicit timestep mode unavailable");
 #define BIND_IMAGE(member,name) if(!bind(image,name,p.member))return false
     BIND_IMAGE(imageCreate,"NvCVImage_Create");BIND_IMAGE(imageDealloc,"NvCVImage_Dealloc");BIND_IMAGE(imageDestroy,"NvCVImage_Destroy");
     BIND_IMAGE(imageInit,"NvCVImage_Init");BIND_IMAGE(fromD3D,"NvCVImage_FromD3DFormat");BIND_IMAGE(errorString,"NvCV_GetErrorStringFromCode");
@@ -695,12 +713,13 @@ bool VfgBackend::fastReady()const{
     return false;
 #endif
 }
-bool VfgBackend::generate(unsigned parity,unsigned sub,unsigned multiplier,bool reset,bool fast){
+bool VfgBackend::generate(unsigned parity,unsigned sub,unsigned multiplier,bool reset,bool fast,double timestep,int primary){
 #ifdef VEYRA_HAVE_CUDA_DRIVER_HEADERS
     auto& p=*impl_;if(!p.ready||p.failed.load()||parity>1||multiplier<2||multiplier>p.maxMultiplier||sub<1||sub>=multiplier)return false;
-    return p.handoff(parity,sub,multiplier,reset,fast);
+    const float explicitTimestep=std::isfinite(timestep)&&timestep>0.0&&timestep<1.0?float(timestep):0.0f;
+    return p.handoff(parity,sub,multiplier,reset,fast,explicitTimestep,primary);
 #else
-    (void)parity;(void)sub;(void)multiplier;(void)reset;(void)fast;return false;
+    (void)parity;(void)sub;(void)multiplier;(void)reset;(void)fast;(void)timestep;(void)primary;return false;
 #endif
 }
 VfgBackend::SubmissionState VfgBackend::submissionState(unsigned slot)const{

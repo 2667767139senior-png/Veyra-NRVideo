@@ -478,6 +478,17 @@ class QmlPlayerBridge : public QObject {
     Q_PROPERTY(bool pacingRepair READ pacingRepair WRITE setPacingRepair NOTIFY settingsChanged)
     Q_PROPERTY(bool hudLock READ hudLock WRITE setHudLock NOTIFY settingsChanged)
     Q_PROPERTY(int hudProtect READ hudProtect WRITE setHudProtect NOTIFY settingsChanged)
+    // 固定目标帧率 (engine/FixedTargetSchedule.h): VFG only. The output runs on a
+    // free-running grid instead of i/M inside every pair. Shell preferences, like
+    // the controls above: the mode and the run cap rebuild the graph, while the
+    // rate and the smoothing knobs are read per pair.
+    Q_PROPERTY(bool fgFixedTarget READ fgFixedTarget WRITE setFgFixedTarget NOTIFY settingsChanged)
+    Q_PROPERTY(int fgFixedTargetFps READ fgFixedTargetFps WRITE setFgFixedTargetFps NOTIFY settingsChanged)
+    Q_PROPERTY(double fgFixedTargetSmoothing READ fgFixedTargetSmoothing WRITE setFgFixedTargetSmoothing NOTIFY settingsChanged)
+    Q_PROPERTY(int fgFixedTargetClampMinMs READ fgFixedTargetClampMinMs WRITE setFgFixedTargetClampMinMs NOTIFY settingsChanged)
+    Q_PROPERTY(int fgFixedTargetClampMaxMs READ fgFixedTargetClampMaxMs WRITE setFgFixedTargetClampMaxMs NOTIFY settingsChanged)
+    // The mode needs live VFG with frame generation on; the panel greys it otherwise.
+    Q_PROPERTY(bool fgFixedTargetAvailable READ fgFixedTargetAvailable NOTIFY settingsChanged)
     Q_PROPERTY(bool dynamicHud READ dynamicHud WRITE setDynamicHud NOTIFY settingsChanged)
     Q_PROPERTY(bool dlssgLiteAvailable READ dlssgLiteAvailable CONSTANT)
     Q_PROPERTY(QString dlssgLiteHint READ dlssgLiteHint NOTIFY snapshotChanged)
@@ -1189,6 +1200,17 @@ public:
     void setHudLock(bool value);
     int hudProtect() const;
     void setHudProtect(int value);
+    bool fgFixedTarget() const;
+    void setFgFixedTarget(bool value);
+    int fgFixedTargetFps() const;
+    void setFgFixedTargetFps(int value);
+    double fgFixedTargetSmoothing() const;
+    void setFgFixedTargetSmoothing(double value);
+    int fgFixedTargetClampMinMs() const;
+    void setFgFixedTargetClampMinMs(int value);
+    int fgFixedTargetClampMaxMs() const;
+    void setFgFixedTargetClampMaxMs(int value);
+    bool fgFixedTargetAvailable() const;
     bool dynamicHud() const;
     void setDynamicHud(bool value);
     bool dlssgLiteAvailable() const;
@@ -1605,6 +1627,8 @@ private:
     // engine has been asked to apply. Every settings property reads this, so
     // they can never disagree with each other.
     engine::EnhancementSettings settings() const;
+    // 固定目标帧率: apply one validated config, then persist all of its knobs.
+    void commitFixedTarget(engine::FixedTargetConfig next, const char* what);
     void startGpuSampler();
     void requestApplicationRestart(bool overlayCompatibility);
     void updateRunStatus();
