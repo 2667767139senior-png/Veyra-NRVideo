@@ -55,8 +55,8 @@ int main() {
     {
         FixedTargetScheduler s;
         const auto plan = s.plan(ms(1000), ms(1033), 30.0);
-        check(!plan.bypass && plan.count == 0 && plan.outputMultiplier == 2,
-              "disabled: no frames, and a group width that interpolates at 0.5");
+        check(!plan.bypass && plan.count == 0 && plan.outputMultiplier == 1,
+              "disabled: no frames, and a group width of 1 (generate nothing)");
         check(std::string(plan.reason) == "off", "disabled: reason=off");
     }
 
@@ -83,6 +83,32 @@ int main() {
         const double fps = observedFps(plans, 60 * 1000.0 / 30.0);
         check(std::abs(fps - 80.0) < 0.5, "30->80: average output rate is the target");
         check(s.stats().droppedByCap == 0, "30->80: nothing dropped");
+    }
+
+    // 30 FPS -> 50 FPS, the shipped default: 33.33 ms asks for 1.67 frames, so the
+    // count walks 1,0,1,1,0,1 and every third-ish pair generates NOTHING. This is
+    // the only target in the panel that reaches count = 0 on ordinary content, so
+    // it is also the only case that proves the "no Run for this pair" path.
+    {
+        FixedTargetScheduler s;
+        s.configure(config(50, 2));
+        std::vector<double> spans(60, 1000.0 / 30.0);
+        const auto plans = run(s, spans);
+        unsigned empty = 0, filled = 0;
+        bool countSane = true, widthMatches = true;
+        for (const auto& p : plans) {
+            if (p.count > 1) countSane = false;
+            if (p.count == 0) ++empty; else ++filled;
+            if (p.outputMultiplier != p.count + 1) widthMatches = false;
+            for (unsigned i = 0; i < p.count; ++i)
+                if (std::abs(p.t[i] - 0.5) > 1e-9) widthMatches = false;
+        }
+        check(countSane, "30->50: 0-1 generated frames per pair");
+        check(empty > 0 && filled > 0, "30->50: some pairs generate nothing, some generate one");
+        check(widthMatches, "30->50: group width is count+1 and t=0.5 when one frame is made");
+        const double fps = observedFps(plans, 60 * 1000.0 / 30.0);
+        check(std::abs(fps - 50.0) < 0.5, "30->50: average output rate is the target");
+        check(s.stats().droppedByCap == 0, "30->50: the cap never bites at two runs");
     }
 
     // The wobble this mode exists for: 30 FPS dipping to 25 FPS. A constant

@@ -28,6 +28,39 @@ carry = want - (count + 1)                     // 余数交给下一对
 
 生成帧的位置是 `t = i/(count+1)`，也就是 **VFG 自己的 `FrameMultiplier=count+1` + `FrameIndex=i`**：和倍率模式走同一条路径，没有新增任何 SDK 依赖。`Timestep` 那条分支仍在 `VfgBackend` 里保留，但管线不再传非零值。
 
+## 门控：模式本身就是开关（2026-11-25 第二次返工）
+
+第一版（自由网格 + 吸附真实帧）和第二版（逐对自适应）在真机上都是"选了完全没反应"，
+根因不在调度算法，而在**补帧是否在跑**这条判断：
+
+```cpp
+// include/veyra/engine/EngineController.h, PlayerOptions::from()
+o.fg = s.multiplier > 1;
+```
+
+固定目标模式在 UI 上会把倍率控件隐藏（用户不必选倍率），倍率就停在原值；补帧卡片
+关过之后 `snapshot()` 还会把它写回 1。于是 `o.fg=false`，`fixedEligible` 恒假，
+调度器一次都不构造计划，日志里一行 `fixed-target` 都没有 —— 界面却显示模式已开启。
+
+现在倍率只是"生成槽位下限"，模式自己就是开关：
+
+| 访问器 | 语义 |
+|---|---|
+| `fixedTargetLive()` | `fgFixedTarget.enabled && backend==Vfg && !presentSink` |
+| `liveMultiplier()` | 模式开时 `max(2, multiplier)`，否则 `multiplier` |
+| `usesFrameGeneration()` | `liveMultiplier() > 1` |
+
+`PlayerOptions::from()`、`requestSettings()` 的 `StageRequest`、`EnhanceGraph::applySettings()`、
+`enhanceGraph::setFgEnabled()` 全部改用它。桥接层另外做了三件事：
+
+1. 选模式时打开补帧节点并把倍率提到 2X（面板上倍率行仍然隐藏）；
+2. 关补帧卡片时清掉模式，避免"卡片关着还在插帧"；
+3. 非 VFG 后端选模式直接拒绝并提示，不存一个没人读的开关。
+
+诊断：模式开但没跑起来时每秒一行
+`fixed-target mode=on but not running: fg=.. backend=.. image=.. presentSink=.. liveMultiplier=..`；
+每次改设置另有 `ui-fixed-target` 一行记录目标帧率、`maxRuns`、生效倍率。
+
 ## 核心调度
 
 `include/veyra/engine/FixedTargetSchedule.h`（纯头文件、无依赖，被设置结构、图和单测共用）。
@@ -67,7 +100,23 @@ carry = want - (count + 1)                     // 余数交给下一对
   - 模式行**始终可见**，非 VFG 后端时置灰并写明"固定目标帧率需要补帧方式选 NVIDIA VFG"（以前是整行隐藏，用户根本找不到）；
   - 不再要求"倍率 > 1"才能出现 —— 补帧关着时倍率本来就是 1，那个门槛把这行藏在了最需要它的时候。
 - **目标帧率取值 0~160**：填 `0` 表示"完全不生成"（`reason=targetOff`），`normalizedFixedTarget()` 把输入钳到 `[0,160]`。
-- **`maxRuns` 跟着目标帧率走**：`fixedTargetRunsFor(targetFps) = clamp(ceil(targetFps/25), 2, 6)`，按"最慢的 25 fps 内容（40 ms）"算需要几帧。80 → 4（历史默认不变）、100 → 4、120 → 5、144 → 6、160 → 6。改目标帧率跨档（4→5/6）会重建一次图，这是槽位数量变化决定的。
+- **`maxRuns` 跟着目标帧率走**：`fixedTargetRunsFor(targetFps) = clamp(ceil(targetFps/25), 2, 6)`，按"最慢的 25 fps 内容（40 ms）"算需要几帧。50 → 2（**默认**）、80 → 4、100 → 4、120 → 5、144 → 6、160 → 6。改目标帧率跨档（2→3/4/5/6）会重建一次图，这是槽位数量变化决定的。
+
+## 默认 50 FPS：唯一会走到"这一对不生成"的目标
+
+`FixedTargetConfig::targetFps` 的默认值是 **50**，不是 80。原因不是口味，而是这是第一个把两条路径都走到的档位：
+
+30 fps 源、`span = 33.33 ms`、目标 50 → `want = 1.667` 帧。于是
+
+```
+count : 1, 0, 1, 1, 0, 1, ...          (60 对里 20 对生成 0 帧)
+输出 : 2, 1, 2, 2, 1, 2, ... 帧/对     (平均 1.667 → 50.00 fps)
+```
+
+- `count=0` 的对 `outputMultiplier = 1`，图里 `fgCalls = 0`，**一次 VFG Run 都不发**；这条路径在 80 fps（`want = 2.67`，count 恒 ≥1）下永远测不到。
+- 目标 ≥ 源帧率时整段旁路（`sourceAtTarget`），所以 50 只对 25~49 fps 的内容生效。
+- 50 fps 的帧**全部落在 60 Hz 刷新的网格上**：间隔只会是 16.7 ms 或 33.3 ms（= 1 或 2 个刷新）。这一点比 80 fps 更适合 60 Hz 屏 —— 80 fps 的 8.3 ms 间隔不是刷新周期的整数倍，呈现端只能靠 vsync 合并，观感并不会比 60 更顺。
+- 反过来，50 的代价是**每三对里有一对完全不插帧**，因此节拍是"顺、顺、停一下"而不是均匀的 20 ms。真实帧不动（AFG 语义）时这是算术上的必然：30 fps 源只能产出 16.7/33.3 ms 两种间隔，凑不出 20 ms。
 
 ## 统计
 

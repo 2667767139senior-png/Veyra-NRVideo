@@ -3477,7 +3477,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 if(processed&&fixedPlanPtr&&host100ns()>=nextFixedTargetLog){
                     nextFixedTargetLog=host100ns()+10000000;
                     const auto& st=fixedTarget.stats();
-                    veyra::log::info("fixed-target",std::format("revision={} targetFps={:.2f} contentFps={:.2f} sourceMs={:.3f} smoothedMs={:.3f} frames={} multiplier={} carry={:.2f} bypass={} reason={} intervals={} generated={} dropped={} bypassLong={} bypassAtTarget={} bypassOff={} (frames = generated frames for this pair, multiplier = frames+1 = the VFG group width, carry = fractional frame handed to the next pair; the real frame is never moved)",
+                    veyra::log::info("fixed-target",std::format("revision={} targetFps={:.2f} contentFps={:.2f} sourceMs={:.3f} smoothedMs={:.3f} frames={} multiplier={} carry={:.2f} bypass={} reason={} intervals={} generated={} dropped={} bypassLong={} bypassAtTarget={} bypassOff={} (frames = generated frames for this pair, multiplier = frames+1 = the VFG group width, multiplier=1 means this pair generated nothing, carry = fractional frame handed to the next pair; the real frame is never moved)",
                         options.settings.revision,options.settings.fgFixedTarget.targetFps,pairContentFps,st.lastSpanMs,st.lastSmoothedSpanMs,
                         fixedPlanPtr->count,fixedPlanPtr->outputMultiplier,st.lastCarry,
                         fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.ticks,st.droppedByCap,st.bypassLong,st.bypassAtTarget,st.bypassOff));

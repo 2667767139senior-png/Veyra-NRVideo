@@ -40,7 +40,7 @@ def llround(x: float) -> int:
 
 
 class Config:
-    def __init__(self, target_fps=80.0, max_runs=4, smoothing=0.0,
+    def __init__(self, target_fps=50.0, max_runs=2, smoothing=0.0,
                  clamp_min_ms=25.0, clamp_max_ms=60.0, max_interval_ms=100.0):
         self.enabled = True
         self.target_fps = target_fps
@@ -54,7 +54,7 @@ class Config:
 class Plan:
     def __init__(self):
         self.count = 0
-        self.multiplier = 2
+        self.multiplier = 1          # count+1: 1 means "generate nothing"
         self.t: list[float] = []
         self.bypass = False
         self.reason = "off"
@@ -133,7 +133,7 @@ class Scheduler:
         else:
             self.carry = max(-1.0, min(1.0, want - (count + 1)))
         out.count = count
-        out.multiplier = max(2, count + 1)
+        out.multiplier = count + 1
         out.t = [(i + 1) / out.multiplier for i in range(count)]
         out.reason = "adaptive" if count else "none"
         self.stats["generated"] += count
@@ -184,6 +184,25 @@ def main() -> int:
                   for p in plans for i in range(p.count))
     check(uniform, "30->80: positions are i/(count+1), VFG's own t = i/M")
     check(s.stats["dropped"] == 0, "30->80: nothing dropped")
+
+    # 30 FPS -> 50 FPS, the shipped default: 33.33 ms asks for 1.67 frames, so the
+    # count walks 1,0,1,1,0,1. This is the only target in the panel that reaches
+    # count = 0 on ordinary content, so it is the case that proves the
+    # "generate nothing for this pair" path the graph turns into fgCalls = 0.
+    cfg50 = Config(50, 2)
+    s50, plans50, total50 = run(cfg50, [1000.0 / 30.0] * 60)
+    fps50 = observed_fps(plans50, total50)
+    empty = sum(1 for p in plans50 if p.count == 0)
+    check(math.isclose(fps50, 50.0, abs_tol=0.5),
+          f"30->50: {fps50:.2f} FPS out (target 50)")
+    check({p.count for p in plans50} <= {0, 1},
+          "30->50: generated frames per pair are 0 or 1")
+    check(0 < empty < len(plans50), f"30->50: {empty}/60 pairs generate nothing")
+    check(all(p.multiplier == p.count + 1 for p in plans50),
+          "30->50: group width is count+1")
+    check(all(abs(p.t[i] - 0.5) < 1e-12 for p in plans50 for i in range(p.count)),
+          "30->50: a generated frame sits exactly halfway")
+    check(s50.stats["dropped"] == 0, "30->50: the cap never bites at two runs")
 
     # The wobble the mode exists for: 30 FPS content dipping to 25 FPS.
     spans = [(40.0 if i % 2 else 1000.0 / 30.0) for i in range(60)]

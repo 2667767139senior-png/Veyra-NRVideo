@@ -46,7 +46,12 @@ inline constexpr int64_t kFixedTargetUnit=10000000;
 
 struct FixedTargetConfig {
     bool enabled=false;
-    double targetFps=80.0;
+    // 50 FPS is the default because it is the one target that exercises both
+    // halves of the arithmetic on the content this mode was written for: a 33 ms
+    // pair at 50 asks for 1.67 frames, so the count walks 1,0,1,1,0,1 instead of
+    // sitting on a fixed group width. A target of 80 or more never asks for zero
+    // frames on such a source, which hides the "generate nothing this pair" path.
+    double targetFps=50.0;
     // Interval smoothing strength, 0..1, 0 = off (the default). With 0 the exact
     // source span decides the count, so the generated frames sit at their true
     // temporal positions. Smoothing averages the span a little for content whose
@@ -79,9 +84,10 @@ inline bool fixedTargetValid(const FixedTargetConfig& c){
 
 // Frames per pair a target rate needs at the slowest content this mode is meant
 // for (25 FPS = 40 ms): 40 ms at 120 FPS is 4.8 frames, so a cap of four would
-// drop one in every interval. 80 FPS comes out at four, the historical default;
-// callers keep maxRuns in step with the target instead of hard-coding it, so
-// typing 144 FPS does not silently arrive capped at 4.
+// drop one in every interval. 50 FPS comes out at two (40 ms x 50 = 2.0 frames),
+// 80 at four, and 160 at seven - capped by kFixedTargetMaxTicks. Callers keep
+// maxRuns in step with the target instead of hard-coding it, so typing 144 FPS
+// does not silently arrive capped at 4.
 inline unsigned fixedTargetRunsFor(double targetFps){
     if(!(targetFps>0.0)||!std::isfinite(targetFps))return 4u;
     return std::clamp(static_cast<unsigned>(std::ceil(targetFps/25.0)),2u,kFixedTargetMaxTicks);
@@ -111,7 +117,10 @@ struct FixedTargetPlan {
     // Generated frames for this pair. The group VFG runs with is count+1 wide,
     // because the real frame is its last member.
     unsigned count=0;
-    unsigned outputMultiplier=2;                 // count+1, never below 2
+    // count+1, i.e. the real group width. 1 means "this pair generates nothing":
+    // the 50 FPS target on a 30 FPS source lands here on every other pair, and a
+    // floor of 2 used to make the telemetry claim a group the graph never ran.
+    unsigned outputMultiplier=1;
     std::array<double,Capacity> t{};             // i/(count+1); telemetry only
     bool bypass=false;
     const char* reason="off";
@@ -191,7 +200,9 @@ public:
             carry_=std::clamp(want-double(count+1),-1.0,1.0);
         }
         out.count=unsigned(count);
-        out.outputMultiplier=std::max(2u,out.count+1u);
+        // Group width, not a clamped multiplier: 1 is a legitimate answer that
+        // means "no Run for this pair", and the graph turns it into fgCalls=0.
+        out.outputMultiplier=out.count+1u;
         for(unsigned i=0;i<out.count;++i)out.t[i]=double(i+1)/double(out.outputMultiplier);
         out.reason=out.count?"adaptive":"none";
         stats_.lastTicks=out.count;

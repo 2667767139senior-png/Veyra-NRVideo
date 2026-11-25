@@ -318,7 +318,7 @@ namespace {
 engine::FixedTargetConfig normalizedFixedTarget(engine::FixedTargetConfig c) {
     // 0-160 with 0 meaning "insert nothing": the panel takes any integer in that
     // range, and the scheduler turns 0 into a bypass rather than a division.
-    c.targetFps = std::clamp(std::isfinite(c.targetFps) ? c.targetFps : 80.0, 0.0, 160.0);
+    c.targetFps = std::clamp(std::isfinite(c.targetFps) ? c.targetFps : 50.0, 0.0, 160.0);
     // The cap has to follow the rate the user typed, or 120 FPS and above would
     // arrive capped at four ticks per interval and show up as dropped frames.
     c.maxRuns = engine::fixedTargetRunsFor(c.targetFps);
