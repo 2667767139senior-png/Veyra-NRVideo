@@ -187,15 +187,33 @@ jobs:
           Copy-Item C:\v\installed\x64-windows\bin\*.dll $stage
           Copy-Item C:\dovi\bin\*.dll $stage
           # Moonlight's crypto links OpenSSL, and find_package may resolve it to the
-          # toolchain preinstalled on the runner rather than to vcpkg, so its DLL is
-          # not in the copy above. Ship whatever CMake actually linked against.
-          $cryptoLib = (Select-String -Path C:\b\CMakeCache.txt -Pattern '^OPENSSL_CRYPTO_LIBRARY:FILEPATH=(.+)$').Matches
-          if ($cryptoLib) {
-            $libDir = Split-Path $cryptoLib[0].Groups[1].Value.Trim()
-            foreach ($cand in @($libDir, "$libDir\..\bin", "$libDir\..\..\bin", "$libDir\..\..\..\bin")) {
-              Get-ChildItem -Path $cand -Filter 'libcrypto*.dll' -ErrorAction SilentlyContinue |
-                ForEach-Object { Copy-Item $_.FullName $stage -Force; "openssl: $($_.FullName)" }
+          # OpenSSL 3 shipped with the runner image rather than to vcpkg, so its DLL is
+          # not in the copy above. Locate whatever the linker actually referenced.
+          $need = @()
+          $dump = (& dumpbin /nologo /dependents "C:\b\veyra_qml_ui.exe" 2>&1)
+          foreach ($line in $dump) {
+            if ($line -match '^\s+(\S+\.dll)\s*$') { $need += $Matches[1] }
+          }
+          $roots = @('C:\v\installed\x64-windows\bin', "$env:ProgramFiles\OpenSSL-Win64",
+                     "${env:ProgramFiles(x86)}\OpenSSL-Win64", 'C:\OpenSSL-Win64',
+                     'C:\Strawberry\c\bin', 'C:\Program Files\OpenSSL', 'C:\tools')
+          foreach ($dll in ($need | Where-Object { $_ -match '^(libcrypto|libssl|dovi)' } | Sort-Object -Unique)) {
+            if (Test-Path -LiteralPath (Join-Path $stage $dll)) { continue }
+            $hit = $null
+            foreach ($root in $roots) {
+              if (-not (Test-Path -LiteralPath $root)) { continue }
+              $hit = Get-ChildItem -LiteralPath $root -Filter $dll -Recurse -File -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+              if ($hit) { break }
             }
+            if (-not $hit) {
+              # Last resort: the rest of the image, still bounded to a few minutes.
+              $hit = Get-ChildItem -Path 'C:\Program Files', 'C:\Program Files (x86)' -Filter $dll -Recurse -File -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            }
+            if (-not $hit) { throw "veyra_qml_ui.exe imports $dll and it is nowhere on this runner" }
+            Copy-Item $hit.FullName $stage -Force
+            "staged  : $dll from $($hit.FullName)"
           }
           & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --qmldir qml --no-translations `
             --skip-plugin-types qmltooling,generic "$stage\veyra_qml_ui.exe"
