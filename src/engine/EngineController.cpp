@@ -3396,10 +3396,18 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         else if(!liveTimeline.anchored(batch.identity.epoch))liveTimeline.reset(batch.identity.epoch,batch.b100ns,liveInputReady,liveSourceInterval100ns(pkt.duration,activeSource->info().averageFps));
                         const auto interval=liveInterval;
                         const auto a=(historyReset||batch.b100ns<=batch.a100ns||batch.b100ns-batch.a100ns>10000000)?batch.b100ns-interval:batch.a100ns;
-                        // AFG admits against the grid's own last slot: that is when this
-                        // pair's generated work must be done, not (M-1)/M of the interval.
-                        const auto lastGenerated=fixedPlanPtr&&fixedPlanPtr->count?
-                            fixedPlanPtr->pts100ns[fixedPlanPtr->count-1]:
+                        // AFG admits against the grid's last OUTPUT slot: that is when
+                        // this pair's work must be done, not (M-1)/M of the interval.
+                        // With no generated frame the real frame is that output, and it
+                        // carries the same lookahead as the generated ones. Falling back
+                        // to the un-shifted midpoint here made the phase jump one period
+                        // on every empty pair: the 30->50 capture trace showed a regular
+                        // 42/20/20/20/20 pattern while every frame claimed to be on time
+                        // against its own (wrong) deadline. One clock for plan, deadline
+                        // and admission.
+                        const auto lastGenerated=fixedPlanPtr?
+                            (fixedPlanPtr->count?fixedPlanPtr->pts100ns[fixedPlanPtr->count-1]:
+                             (fixedPlanPtr->realPts100ns>0?fixedPlanPtr->realPts100ns:batch.b100ns)):
                             pipeline::FrameBatch::interpolate(a,batch.b100ns,previewFgMultiplier-1,previewFgMultiplier);
                         const auto now=host100ns();
                         const double elapsed=elapsedMs(processStart);
@@ -3574,7 +3582,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         std::string hist;
                         for(unsigned i=0;i<AfgOutputPace::Buckets;++i)
                             if(pace.histogram[i])hist+=std::format("{}{:.0f}-{:.0f}ms={}",hist.empty()?"":" ",double(i)*pace.bucketMs,double(i+1)*pace.bucketMs,pace.histogram[i]);
-                        veyra::log::info("afg-output",std::format("targetFps={} samples={} intervalMs p50={:.2f} p95={:.2f} p99={:.2f} mean={:.2f} sd={:.2f} devMs p50={:.2f} p95={:.2f} p99={:.2f} offCadence={} tail={} (measured between successful Present calls; devMs is |interval - 1000/targetFps|, the acceptance metric, because a correct mean with a 7 ms spread is not uniform; offCadence counts intervals further than 10% from the target period; tail is the histogram of intervals, last bucket open-ended)",
+                        veyra::log::info("afg-output",std::format("targetFps={} samples={} intervalMs p50={:.2f} p95={:.2f} p99={:.2f} mean={:.2f} sd={:.2f} devP50={:.2f} devP95={:.2f} devP99={:.2f} offCadence={} tail={} (measured between successful Present calls; devMs is |interval - 1000/targetFps|, the acceptance metric, because a correct mean with a 7 ms spread is not uniform; offCadence counts intervals further than 10% from the target period; tail is the histogram of intervals, last bucket open-ended)",
                             options.settings.fgFixedTarget.targetFps,pace.samples,pace.p50,pace.p95,pace.p99,pace.mean,pace.stddev,
                             pace.devP50,pace.devP95,pace.devP99,pace.offCadence,hist));
                     }
