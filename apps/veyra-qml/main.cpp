@@ -563,6 +563,24 @@ LONG WINAPI crashFilter(EXCEPTION_POINTERS* info) {
 }
 } // namespace
 
+// The AFG setup the panel and the test switches share, in the order the panel
+// applies it (backend -> multiplier floor -> mode -> rate -> cadence -> buffer).
+// One copy on purpose: a test that set these in a different order would prove
+// something about the test, not about the product.
+static void applyAfgTestSettings(ui::QmlPlayerBridge& bridge, int fps,
+                                 const QString& cadence, const QString& buffer) {
+    bridge.setFgBackendName(QStringLiteral("vfg"));
+    bridge.setFgMultiplier(2);
+    bridge.setFgMode(1);
+    bridge.setFgFixedTargetFps(fps);
+    bridge.setFgFixedTargetCadence(cadence == QLatin1String("latency") ? 1 : 0);
+    bridge.setFgFixedTargetBuffer(buffer == QLatin1String("tight") ? 0
+                                     : buffer == QLatin1String("relaxed") ? 2 : 1);
+    veyra::log::info("qml-test", std::format("afg: fps={} cadence={} buffer={} backend={} mode={}",
+                                            fps, cadence.toStdString(), buffer.toStdString(),
+                                            bridge.fgBackendName().toStdString(), bridge.fgMode()));
+}
+
 static int runApplication(int argc, char** argv, QString& restartProgram, QStringList& restartArgs) {
     const bool updateProbe = argc > 2 && std::strcmp(argv[1], "--portable-update-probe") == 0;
     // ExportJobManager relaunches the owning executable with an inherited mapping.
@@ -1063,16 +1081,39 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
             if (i + 1 < args.size() && !args.at(i + 1).startsWith(QLatin1Char('-'))) cadence = args.at(++i);
             if (i + 1 < args.size() && !args.at(i + 1).startsWith(QLatin1Char('-'))) buffer = args.at(++i);
             QTimer::singleShot(1200, &bridge, [&bridge, fps, cadence, buffer] {
+                applyAfgTestSettings(bridge, fps, cadence, buffer);
+            });
+        } else if (a == QLatin1String("--afg-after") && hasValue) {
+            // Test switch: start in the legacy multiplier mode, then hand over to
+            // AFG mid-play. This is the mode switch the product has to survive -
+            // state released, grid anchored, statistics reset - without stopping
+            // the player. Format: --afg-after <ms> <fps> [fixed|latency] [tight|balanced|relaxed]
+            const int afterMs = args.at(++i).toInt();
+            int fps = 50;
+            if (i + 1 < args.size() && !args.at(i + 1).startsWith(QLatin1Char('-'))) fps = args.at(++i).toInt();
+            QString cadence = QStringLiteral("fixed"), buffer = QStringLiteral("balanced");
+            if (i + 1 < args.size() && !args.at(i + 1).startsWith(QLatin1Char('-'))) cadence = args.at(++i);
+            if (i + 1 < args.size() && !args.at(i + 1).startsWith(QLatin1Char('-'))) buffer = args.at(++i);
+            QTimer::singleShot(0, &bridge, [&bridge] {
                 bridge.setFgBackendName(QStringLiteral("vfg"));
+                bridge.setFgMode(0);
                 bridge.setFgMultiplier(2);
-                bridge.setFgMode(1);
-                bridge.setFgFixedTargetFps(fps);
-                bridge.setFgFixedTargetCadence(cadence == QLatin1String("latency") ? 1 : 0);
-                bridge.setFgFixedTargetBuffer(buffer == QLatin1String("tight") ? 0
-                                                 : buffer == QLatin1String("relaxed") ? 2 : 1);
-                veyra::log::info("qml-test", std::format("afg: fps={} cadence={} buffer={} backend={} mode={}",
-                                                         fps, cadence.toStdString(), buffer.toStdString(),
-                                                         bridge.fgBackendName().toStdString(), bridge.fgMode()));
+            });
+            QTimer::singleShot(afterMs > 1200 ? afterMs : 1200, &bridge, [&bridge, fps, cadence, buffer] {
+                applyAfgTestSettings(bridge, fps, cadence, buffer);
+            });
+        } else if (a == QLatin1String("--legacy") && hasValue) {
+            // Test switch: the legacy multiplier path, reached through the panel's
+            // own setters. The AFG regression suite runs this before and after the
+            // new mode to show the old behaviour is bit-for-bit what it was.
+            const int multiplier = args.at(++i).toInt();
+            QTimer::singleShot(1200, &bridge, [&bridge, multiplier] {
+                bridge.setFgBackendName(QStringLiteral("vfg"));
+                bridge.setFgMode(0);
+                bridge.setFgMultiplier(multiplier);
+                veyra::log::info("qml-test", std::format("legacy multiplier: {} backend={} mode={}",
+                                                        multiplier, bridge.fgBackendName().toStdString(),
+                                                        bridge.fgMode()));
             });
         } else if (a == QLatin1String("--fg-auto")) {
             // Test switch: turn the automatic multiplier on (or off with `--fg-auto off`).
