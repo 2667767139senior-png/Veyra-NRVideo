@@ -296,6 +296,26 @@ void testExistingChainContracts() {
             check(!requiresGraphRebuild(off, on) && on.sameVideoConfiguration(off),
                   "XeSS holds the choice without using or rebuilding the graph HUD pass");
         }
+        // Switching legacy multiplier <-> AFG changes the VFG generated-pool
+        // width even though the user multiplier and every stage above stay put.
+        // Without this the settings commit is rejected ("设置应用失败").
+        {
+            EnhancementSettings legacy;
+            legacy.multiplier = 2;
+            legacy.frameGenerationBackend = FrameGenerationBackend::Vfg;
+            EnhancementSettings afg = legacy;
+            afg.fgFixedTarget.enabled = true;
+            afg.fgFixedTarget.maxRuns = fixedTargetRunsFor(50.0);   // pool grows 2 -> 5
+            check(requiresGraphRebuild(legacy, afg) && requiresGraphRebuild(afg, legacy),
+                  "legacy multiplier <-> AFG rebuilds the VFG pool");
+            check(legacy.fgFixedTarget.maxRuns == 2 || afg.fgFixedTarget.maxRuns > legacy.fgFixedTarget.maxRuns,
+                  "AFG asks for more generated slots than legacy 2x");
+            // A per-pair tuning change (rate) must NOT rebuild.
+            EnhancementSettings afgFaster = afg;
+            afgFaster.fgFixedTarget.targetFps = 60.0;
+            check(!requiresGraphRebuild(afg, afgFaster),
+                  "changing AFG target rate does not rebuild (per-pair only)");
+        }
         { auto next = base; next.nrTemporal = false;
           check(requiresGraphRebuild(base, next), "toggling temporal anti-flicker rebuilds"); }
         { auto next = base; next.videoHdr.enabled = false;

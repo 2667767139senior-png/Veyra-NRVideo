@@ -777,6 +777,16 @@ bool requiresGraphRebuild(const EnhancementSettings& savedPrevious, const Enhanc
             uint64_t(s.color.enabled), uint64_t(s.videoSrQuality)};
     };
     if (planOf(previous) != planOf(next)) return true;
+    // AFG (fixed target) sizes the VFG generated pool by fixedTargetCapacity(),
+    // not by the user's multiplier. Switching legacy multiplier <-> AFG, or
+    // changing the run cap, therefore changes vfgSlotCount() even when every
+    // field above is identical. EnhanceGraph::applySettings() rejects such a
+    // mismatch and rolls the whole settings change back, which the user sees
+    // as "设置应用失败，已恢复上一套参数" when they enable AFG while a
+    // multiplier is selected. Treat the two structural AFG fields as rebuild
+    // inputs so the graph is rebuilt to the new width. Rate/cadence/buffer
+    // details remain live (see EnhancementSettings::sameVideoConfiguration).
+    if (!fixedTargetSameStructure(previous.fgFixedTarget, next.fgFixedTarget)) return true;
     if (previous.lowLatency != next.lowLatency) return true;
     if(previous.exclusion.enabled!=next.exclusion.enabled)return true;
     if(previous.videoDenoiseEnabled!=next.videoDenoiseEnabled)return true;

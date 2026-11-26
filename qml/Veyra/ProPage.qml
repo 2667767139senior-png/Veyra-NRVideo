@@ -2002,7 +2002,7 @@ VPage {
                             }
                             VRow {
                                 label: qsTr("VFG 自动调控")
-                                visible: veyra.fgBackendName === "vfg"
+                                visible: veyra.fgBackendName === "vfg" && veyra.fgMode !== 1
                                 enabled: veyra.vfgQuality !== 0 && veyra.fgMultiplier === 2
                                 opacity: enabled ? 1 : 0.5
                                 hint: qsTr("实时采集 2X 时，当前档来不及赶上屏幕刷新，这一对帧就改用下一档，不丢帧也不加延迟。多占约 2 GB 显存，显存不够时不生效")
@@ -2023,7 +2023,7 @@ VPage {
                             VRow {
                                 objectName: "list-fg-auto-multiplier"
                                 label: qsTr("自动选择倍率")
-                                visible: veyra.fgAutoMultiplierAvailable
+                                visible: veyra.fgAutoMultiplierAvailable && veyra.fgMode !== 1
                                 hint: veyra.fgAutoMultiplierEnabled
                                       ? qsTr("按源帧率和输出上限自动选档；源帧率超过上限时关闭补帧")
                                       : qsTr("关闭时按手动选的倍率 · 默认关闭")
