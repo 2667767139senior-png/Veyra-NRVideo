@@ -11,7 +11,7 @@ MAX_TICKS = 7
 def runs_for(fps):
     if not (fps > 0.0) or not math.isfinite(fps):
         return 4
-    return max(2, min(MAX_TICKS, math.ceil(fps / 25.0)))
+    return max(2, min(MAX_TICKS, math.ceil(fps / 15.0)))
 
 
 def policy_cap(policy, rate_cap):
@@ -366,7 +366,7 @@ check(capacity(off, 1) == 1, "legacy: multiplier 1 stays 1")
 sl = Scheduler(off)
 p = sl.plan(0, ms(33.3), 30.0)
 check(p.bypass and p.count == 0 and p.real == 0, "legacy: an off scheduler plans nothing")
-check(capacity(Config(True, 50.0), 2) == 3, "afg: pool covers maxRuns + 1")
+check(capacity(Config(True, 50.0), 2) == 5, "afg: pool covers maxRuns + 1")
 check(capacity(Config(True, 160.0), 2) == 8, f"afg: 160 FPS sizes an 8-wide group (got {capacity(Config(True, 160.0), 2)})")
 check(valid(Config(False)), "the disabled config is always valid")
 check(valid(Config(True, 50.0)), "the default AFG config is valid")
@@ -375,7 +375,7 @@ check(not valid(Config(True, 481.0)), "a target above 480 is rejected")
 check(not valid(Config(True, 50.0, max_runs=0)), "maxRuns 0 is rejected")
 check(not valid(Config(True, 50.0, max_runs=MAX_TICKS + 1)), "maxRuns past the pool is rejected")
 check(not valid(Config(True, 50.0, max_interval=10.0)), "a max interval below one period is rejected")
-check(runs_for(50.0) == 2, "50 FPS asks for at most two frames per pair")
+check(runs_for(50.0) == 4, "50 FPS leaves room for a slow pair's slots")
 check(runs_for(160.0) == 7, "160 FPS asks for seven")
 
 

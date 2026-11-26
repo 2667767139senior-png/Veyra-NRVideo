@@ -298,7 +298,7 @@ int main() {
         s.configure(off);
         const FixedTargetPlan p = s.plan(0, ms(33.3), 30.0);
         check(p.bypass && p.count == 0 && p.realPts100ns == 0, "legacy: an off scheduler plans nothing");
-        check(fixedTargetCapacity(config(50.0), 2) == 3, "afg: the pool covers maxRuns + 1");
+        check(fixedTargetCapacity(config(50.0), 2) == 5, "afg: the pool covers maxRuns + 1");
         check(fixedTargetCapacity(config(160.0), 2) == 8, "afg: 160 FPS sizes an 8-wide group");
         check(fixedTargetSameStructure(config(50.0, 2), config(80.0, 2)),
               "afg: a rate change keeps the same graph structure");
@@ -481,7 +481,7 @@ int main() {
         check(!fixedTargetValid(v), "maxRuns past the slot pool is rejected");
         v = config(50.0); v.maxIntervalMs = 10;
         check(!fixedTargetValid(v), "a max interval below one period is rejected");
-        check(fixedTargetRunsFor(50.0) == 2, "50 FPS asks for at most two frames per pair");
+        check(fixedTargetRunsFor(50.0) == 4, "50 FPS leaves room for a slow pair's slots");
         check(fixedTargetRunsFor(160.0) == 7, "160 FPS asks for seven");
     }
 

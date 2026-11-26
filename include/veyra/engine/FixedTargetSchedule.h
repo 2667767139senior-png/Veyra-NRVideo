@@ -129,7 +129,13 @@ inline unsigned fixedTargetPolicyCap(FixedTargetBufferPolicy p,unsigned rateCap)
 // does not silently arrive capped at 4.
 inline unsigned fixedTargetRunsFor(double targetFps){
     if(!(targetFps>0.0)||!std::isfinite(targetFps))return 4u;
-    return std::clamp(static_cast<unsigned>(std::ceil(targetFps/25.0)),2u,kFixedTargetMaxTicks);
+    // The grid must be allowed to ask for what a slow pair actually needs.
+    // A 15 FPS picture at 90 FPS needs five generated frames, and at 120 FPS
+    // seven; sizing by target/25 capped them at four/five and dropped slots
+    // before the GPU ever had a chance to say what it could afford. The
+    // measured load lever now makes that decision, and marks every slot it
+    // removes, so the cap here is only VFG's eight-slot pool.
+    return std::clamp(static_cast<unsigned>(std::ceil(targetFps/15.0)),2u,kFixedTargetMaxTicks);
 }
 
 // The two fields the graph is built around: whether the mode runs at all, and how
