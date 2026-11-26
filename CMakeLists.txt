@@ -623,6 +623,12 @@ target_link_libraries(veyra_pipeline_tests PRIVATE veyra_pipeline)
 add_executable(veyra_vfg_gpu_tests tests/integration/VfgGpuTests.cpp)
 target_compile_features(veyra_vfg_gpu_tests PRIVATE cxx_std_20)
 target_link_libraries(veyra_vfg_gpu_tests PRIVATE veyra_pipeline)
+# AFG depends on VFG's explicit-timestep mode, so its position is measured on a
+# real GPU instead of assumed: CI builds this probe, a machine with the runtime
+# runs it.
+add_executable(veyra_vfg_timestep_probe tests/integration/VfgTimestepProbe.cpp)
+target_compile_features(veyra_vfg_timestep_probe PRIVATE cxx_std_20)
+target_link_libraries(veyra_vfg_timestep_probe PRIVATE veyra_pipeline)
 add_executable(veyra_vfg_ampere_tests tests/unit/VfgAmpereTests.cpp)
 target_compile_features(veyra_vfg_ampere_tests PRIVATE cxx_std_20)
 target_compile_options(veyra_vfg_ampere_tests PRIVATE /utf-8)

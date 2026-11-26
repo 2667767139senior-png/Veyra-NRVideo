@@ -166,6 +166,14 @@ jobs:
           & C:\b\veyra_fixed_target_schedule_tests.exe
           if ($LASTEXITCODE -ne 0) { throw "veyra_fixed_target_schedule_tests failed with $LASTEXITCODE" }
 
+      # Built here, run on a machine that actually has the runtime: CI has no GPU,
+      # and whether VFG's timestep mode places a frame where it was asked to is
+      # what the AFG scheduler rests on.
+      - name: Build VFG timestep probe
+        run: |
+          cmake --build C:\b --target veyra_vfg_timestep_probe
+          if (!(Test-Path C:\b\veyra_vfg_timestep_probe.exe)) { throw "probe exe missing" }
+
       - name: Stage portable package
         run: |
           $name = "Veyra-$($env:GITHUB_SHA.Substring(0, 10))-win64-ci-no-gpu-runtimes"
@@ -289,6 +297,11 @@ jobs:
           path: |
             C:\out\*.zip
             C:\out\SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: veyra-vfg-timestep-probe
+          path: C:\b\veyra_vfg_timestep_probe.exe
 
       - name: Attest build provenance
         if: github.event_name != 'pull_request'
