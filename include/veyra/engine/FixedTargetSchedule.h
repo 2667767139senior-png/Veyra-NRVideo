@@ -162,6 +162,11 @@ struct FixedTargetPlan {
     std::array<int64_t,Capacity> pts100ns{};
     // VFG Timestep for the same frame: (pts - a) / (b - a), strictly inside (0,1).
     std::array<double,Capacity> timestep{};
+    // Grid index of each generated frame and of the real frame, so the per-frame
+    // trace can name a slot instead of an absolute time: "slot 1234" survives a
+    // re-anchor, "29640 ms" does not.
+    std::array<long long,Capacity> slotIndex{};
+    long long realSlot=0;
     // Presentation time to use for the real frame (0 = keep its own timestamp).
     // Slots are snapped up, so this is at or after b, plus the guard below.
     int64_t realPts100ns=0;
@@ -371,8 +376,9 @@ public:
             first=found-limit;found=limit;
         }
         out.count=found;
-        for(unsigned i=0;i<found;++i){out.pts100ns[i]=pts[first+i]+guard;out.timestep[i]=steps[first+i];}
+        for(unsigned i=0;i<found;++i){out.pts100ns[i]=pts[first+i]+guard;out.timestep[i]=steps[first+i];out.slotIndex[i]=lastSlot_+1+first+i;}
         out.outputMultiplier=found+1u;
+        out.realSlot=slotB;
         if(config_.cadence==FixedTargetCadence::Fixed){
             out.realPts100ns=slotTime(slotB)+guard;
             stats_.lastSnapMs=double(out.realPts100ns-guard-b100ns)/10000.0;

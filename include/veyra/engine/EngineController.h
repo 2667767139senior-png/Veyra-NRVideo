@@ -102,6 +102,19 @@ struct AfgStatus {
     uint64_t guardChanges=0;
     uint64_t generated=0,droppedCap=0,droppedNear=0,droppedLoad=0,resyncs=0;
     uint64_t bypassLong=0,bypassAtTarget=0,bypassOff=0;
+    // Per-slot accounting for the last control window and for the session: every
+    // slot the grid asked for is either presented as a real frame, presented as a
+    // generated frame, or counted as dropped with a reason. planned - presented -
+    // dropped is the number of slots that simply went missing, which must stay 0
+    // and is the only honest answer to "was every slot filled".
+    uint64_t slotsPlanned=0,slotsRealPresented=0,slotsGeneratedPresented=0;
+    uint64_t slotsDroppedLate=0,slotsDroppedCapacity=0,slotsDroppedFailed=0,slotsMissing=0;
+    // Pairs where the GPU could not take the work the grid asked for, so the plan
+    // was cut before submitting rather than queued and dropped later.
+    uint64_t overloadPairs=0;
+    // The capacity lever (generated frames a pair may ask for) as opposed to the
+    // latency lever (guardExtra). Both are capped, both are logged when they move.
+    unsigned loadCap=0,loadCapChanges=0;
     // Interval between our own successful presents (AfgOutputPace). This is the
     // output cadence as delivered, not as planned.
     unsigned paceSamples=0,offCadence=0;
@@ -109,6 +122,12 @@ struct AfgStatus {
     // VFG's measured per-frame GPU cost (Fg1 P95) and the share of the output
     // period it takes; >=1 means the GPU cannot fill the target.
     double fgGpuP95Ms=0;
+    // Display capability, so the panel can say "this panel cannot show the target"
+    // instead of the log alone knowing it. refreshHz is the swapchain's measured
+    // refresh; targetAboveRefresh means the target rate is not representable by a
+    // vsynced flip chain, which changes what Present intervals can mean.
+    double displayHz=0;
+    bool targetAboveRefresh=false;
     // Why the mode is not running, ASCII (EnhanceGraph/engine gate name), empty
     // when it runs.
     std::string blocked;

@@ -206,7 +206,13 @@ void EngineController::setFullscreenMemoryProtection(bool enabled){
     if(!enabled){std::lock_guard lock(mutex_);snapshot_.vramFullscreenUnsafe=false;}
 }
 void EngineController::open(HWND video,const std::wstring& path,PlayerOptions opts){
-    const bool captureReplay=opts.captureReplayForTest;
+    // VEYRA_TEST_CAPTURE_REPLAY=1 opens any file through the live scheduler. It is
+    // the only way to measure AFG on the path a capture card actually takes, and
+    // the acceptance numbers have to come from there: file playback paces against
+    // the audio clock, capture paces against its own pair anchors, and AFG only
+    // changes the second one.
+    const bool captureReplay=opts.captureReplayForTest||
+        (GetEnvironmentVariableW(L"VEYRA_TEST_CAPTURE_REPLAY",nullptr,0)>0&&!path.starts_with(L"capture:"));
     // Diagnostics-only PlayerOptions fields never enter EnhancementSettings;
     // keep them across the snapshot round-trip below.
     const bool captureCpuUnpack=opts.captureCpuUnpack;
@@ -1426,6 +1432,24 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             // the lookahead come back down, so it never oscillates per frame.
             unsigned afgGuardCleanWindows=0;
             uint64_t afgGuardChanges=0;
+            // The capacity lever: generated frames a pair may ask for. Started at the
+            // configured ceiling and moved by the same windows that move the guard -
+            // shedding one slot is cheaper than paying every frame another period of
+            // latency, so work is shed first.
+            unsigned afgLoadCap=0;           // 0 = not yet initialised
+            unsigned afgLoadCleanWindows=0;
+            uint64_t afgLoadChanges=0;
+            // Per-slot accounting of what the grid asked for versus what left the
+            // presenter. Session totals live in the scheduler's stats; these are the
+            // ones only the present step can see.
+            uint64_t afgSlotsPlanned=0,afgSlotsRealPresented=0,afgSlotsGeneratedPresented=0;
+            uint64_t afgSlotsDroppedLate=0,afgSlotsDroppedCapacity=0,afgSlotsDroppedFailed=0;
+            uint64_t afgOverloadPairs=0;
+            // Per-frame AFG trace (VEYRA_TEST_AFG_TRACE=1): one line per output frame
+            // with the slot, timestep, readiness and Present time. The spec asks for
+            // a traceable chain from source frame to scanout; this is the part of it
+            // the scheduler owns.
+            const bool afgTrace=GetEnvironmentVariableW(L"VEYRA_TEST_AFG_TRACE",nullptr,0)>0;
             uint64_t nextFixedTargetLog=0;
             // Capture-card FG pairs: automatic deadline margin (0-1 ms) on top of the phase.
             LiveDeadlineMargin deadlineMargin;
@@ -3234,6 +3258,17 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     else{fixedPlan.bypass=true;fixedPlan.reason="firstPair";}
                     previewFgMultiplier=std::max(2u,fixedPlan.count+1);
                     fixedPlanPtr=&fixedPlan;
+                    // The grid's demand for this pair, counted where it is decided:
+                    // generated slots plus the real frame's slot. The present step
+                    // accounts for every one of them, so the ledger closes.
+                    if(!fixedPlan.bypass){
+                        afgSlotsPlanned+=fixedPlan.count+1u;
+                        // The plan was cut before submission because the capacity
+                        // lever said the GPU could not take it. That IS the overload
+                        // policy: shed slots up front and mark them, never queue work
+                        // that will be dropped at Present anyway.
+                        if(fixedPlan.droppedLoad)++afgOverloadPairs;
+                    }
                 }else if(options.settings.fgFixedTarget.enabled){
                     // Selected but not running - the failure mode that looked like "the
                     // feature does nothing": the mode is on, the panel hides the
@@ -3553,57 +3588,71 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         if(sample)fgP95=*sample;
                     }
                     const double targetFps=options.settings.fgFixedTarget.targetFps;
-                    const double spanMs=st.lastSpanMs>0.0?st.lastSpanMs:(targetFps>0.5?1000.0/targetFps:33.3);
-                    unsigned affordable=kFixedTargetMaxTicks;
-                    if(std::isfinite(fgP95)&&fgP95>0.05&&spanMs>0.0)
-                        affordable=std::clamp(unsigned(std::floor(spanMs/fgP95)),1u,kFixedTargetMaxTicks);
-                    fixedTarget.setLoadCap(options.settings.fgFixedTarget.gpuLoadAdapt?affordable:0u);
-                    // Lookahead control loop. A generated frame between A and B cannot
-                    // exist before B arrives, so its slot is due earlier than the input
-                    // that makes it; the one-interval base guard covers the average
-                    // case and nothing else. On the 2026-11-26 720p30 run the base gave
-                    // 26.7 ms of lead against a measured 24-30 ms graph time and one
-                    // batch in three landed 7 ms late (p50 19.95 / p95 27.11, mean
-                    // exactly 20.00 - the 27/13 alternation this mode exists to remove).
-                    //
-                    // So the guard is raised until the frames that actually reached
-                    // Present stop being late, and only then. It reads the symptom, not
-                    // a model of VFG's cost: that cost measured 4.4 to 30.1 ms on the
-                    // same GPU within one minute, so any constant derived from it would
-                    // be either wrong or permanently oversized.
                     const double periodMs=targetFps>0.5?1000.0/targetFps:20.0;
+                    const unsigned maxRuns=options.settings.fgFixedTarget.maxRuns;
+                    if(afgLoadCap==0||afgLoadCap>maxRuns)afgLoadCap=maxRuns;
                     const auto lateGen=afgLateGenerated.summary();
                     const auto lateReal=afgLateReal.summary();
                     afgLateGenerated.reset();afgLateReal.reset();
                     const double worstLate=std::max(lateGen.p95,lateReal.p95);
                     const bool configFixedCadence=options.settings.fgFixedTarget.cadence==FixedTargetCadence::Fixed;
                     const unsigned guardBefore=fixedTarget.guardExtraPeriods();
+                    const unsigned loadBefore=afgLoadCap;
                     unsigned guardExtra=guardBefore;
-                    // The latency cadence takes no lookahead at all (its real frames keep
-                    // their own timestamps, so shifting the generated ones would put them
-                    // behind the next real frame). Regulating a guard it does not use
-                    // would only fill the log with a value that means nothing.
+                    // Two levers, one symptom, in a fixed order.
+                    //
+                    // A generated frame that reaches Present late means the GPU did not
+                    // have the frame ready in time. There are exactly two ways to fix
+                    // that: ask for fewer frames (lose one slot this pair) or start
+                    // earlier (add a period of latency to every frame, forever). The
+                    // cheap one goes first, and only a pair already down to a single
+                    // generated frame - where there is nothing left to shed - is allowed
+                    // to buy latency. Recovery reverses the order: give latency back
+                    // before asking for work again, so a passing overload does not leave
+                    // the mode permanently one frame short.
+                    //
+                    // Neither loop models VFG's cost: that cost measured 4.4 to 30.1 ms
+                    // on the same GPU inside one minute (2026-11-26), so any constant
+                    // derived from it is either wrong or permanently oversized. They
+                    // regulate the symptom instead, which survives a GPU, driver, scene
+                    // or source-rate change.
+                    //
                     // The window right after the grid anchors is not evidence: the
                     // pipeline has no history, its first frames are cold, and they are
-                    // late for a reason the lookahead cannot fix. Acting on it pinned
-                    // the guard at the ceiling for the first ten seconds of a run.
+                    // late for a reason neither lever can fix. Acting on it pinned the
+                    // guard at the ceiling for the first ten seconds of a run.
                     const bool guardWarm=st.intervals>=10;
-                    if(configFixedCadence&&guardWarm&&lateGen.samples+lateReal.samples>=6){
+                    const bool haveSamples=lateGen.samples+lateReal.samples>=6;
+                    if(configFixedCadence&&guardWarm&&haveSamples){
                         if(worstLate>AfgLateness::kLateMs){
-                            // One period of lookahead per period of lateness, plus one
-                            // for the frames that were not sampled, capped at two per
-                            // window so a single stall cannot jump straight to the ceiling.
-                            const unsigned need=unsigned(std::ceil(worstLate/std::max(1.0,periodMs)-1e-9));
-                            guardExtra=std::min(kFixedTargetMaxGuardPeriods-1u,
-                                guardBefore+std::min(2u,std::max(1u,need)));
+                            if(afgLoadCap>1u){
+                                --afgLoadCap;afgLoadCleanWindows=0;afgGuardCleanWindows=0;
+                            }else{
+                                // One period per period of lateness, plus one for the
+                                // frames that were not sampled, at most two per window so
+                                // a single stall cannot jump to the ceiling.
+                                const unsigned need=unsigned(std::ceil(worstLate/std::max(1.0,periodMs)-1e-9));
+                                guardExtra=std::min(kFixedTargetMaxGuardPeriods-1u,
+                                    guardBefore+std::min(2u,std::max(1u,need)));
+                                afgGuardCleanWindows=0;
+                            }
+                        }else if(++afgLoadCleanWindows>=3){
+                            afgLoadCleanWindows=0;
+                            if(guardExtra>0)--guardExtra;            // latency first
+                            else if(afgLoadCap<maxRuns)++afgLoadCap;  // then work
                             afgGuardCleanWindows=0;
-                        }else if(guardExtra>0&&++afgGuardCleanWindows>=4){
-                            // Four clean seconds is the evidence for giving a period
-                            // back; a shorter window made the loop chase its own tail.
-                            --guardExtra;afgGuardCleanWindows=0;
                         }
                     }
                     fixedTarget.setGuardExtraPeriods(guardExtra);
+                    // The measured cost is still reported (it explains the ceiling),
+                    // but it no longer sets the cap: the feedback loop owns that.
+                    const bool loadAdapt=options.settings.fgFixedTarget.gpuLoadAdapt;
+                    fixedTarget.setLoadCap(loadAdapt?afgLoadCap:0u);
+                    if(afgLoadCap!=loadBefore){
+                        ++afgLoadChanges;
+                        veyra::log::info("afg-loadcap",std::format("revision={} framesPerPair={}->{} configured={} lateGenP95Ms={:.3f} lateRealP95Ms={:.3f} fgGpuP95Ms={:.3f} periodMs={:.3f} changes={} (the capacity lever: shed one generated slot per pair before buying a period of lookahead; raised back after 3 clean windows, latency given back first)",
+                            options.settings.revision,loadBefore,afgLoadCap,maxRuns,lateGen.p95,lateReal.p95,fgP95,periodMs,afgLoadChanges));
+                    }
                     const unsigned basePeriods=fixedTarget.guardBasePeriods();
                     if(guardExtra!=guardBefore){
                         ++afgGuardChanges;
@@ -3640,6 +3689,22 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         afg.paceSamples=pace.samples;afg.offCadence=pace.offCadence;
                         afg.p50Ms=pace.p50;afg.p95Ms=pace.p95;afg.p99Ms=pace.p99;afg.stddevMs=pace.stddev;
                         afg.fgGpuP95Ms=fgP95;
+                        afg.loadCap=fixedTarget.effectiveMaxRuns();afg.loadCapChanges=afgLoadChanges;
+                        afg.slotsPlanned=afgSlotsPlanned;
+                        afg.slotsRealPresented=afgSlotsRealPresented;
+                        afg.slotsGeneratedPresented=afgSlotsGeneratedPresented;
+                        afg.slotsDroppedLate=afgSlotsDroppedLate;
+                        afg.slotsDroppedCapacity=afgSlotsDroppedCapacity;
+                        afg.slotsDroppedFailed=afgSlotsDroppedFailed;
+                        const uint64_t accounted=afgSlotsRealPresented+afgSlotsGeneratedPresented+
+                            afgSlotsDroppedLate+afgSlotsDroppedCapacity+afgSlotsDroppedFailed;
+                        afg.slotsMissing=afgSlotsPlanned>accounted?afgSlotsPlanned-accounted:0;
+                        afg.overloadPairs=afgOverloadPairs;
+                        afg.displayHz=refreshHz;
+                        // A vsynced flip chain can only scan out a rate the panel can
+                        // hit. Saying so here is the difference between "the scheduler
+                        // held 50 FPS" and "the panel showed 50 FPS".
+                        afg.targetAboveRefresh=refreshHz>1.0&&targetFps>refreshHz+0.5;
                     }
                     afgStatusPublished=true;
                     // One line per second, enough to reconstruct the grid: slot times
@@ -3660,6 +3725,22 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         st.lastGuardPeriods,fixedTarget.guardExtraPeriods(),lateGen.p95,lateReal.p95,
                         afgRateFps,fgP95,fixedTarget.effectiveMaxRuns(),
                         fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.generated,st.droppedCap,st.droppedNear,st.droppedLoad,st.loadLimitedPairs,st.resyncs,st.bypassLong,st.bypassAtTarget,st.bypassOff));
+                    // Per-slot ledger, one line per second. Every slot the grid asked
+                    // for is in exactly one column, so "was the target actually
+                    // filled" needs no averaging: planned - real - generated - dropped
+                    // is the number of slots that went missing, and it must be 0.
+                    {
+                        static uint64_t p0=0,r0=0,g0=0,l0=0,c0=0,f0=0;
+                        const uint64_t rp=afgSlotsRealPresented-r0,gp=afgSlotsGeneratedPresented-g0;
+                        const uint64_t dl=afgSlotsDroppedLate-l0,dc=afgSlotsDroppedCapacity-c0,df=afgSlotsDroppedFailed-f0;
+                        const uint64_t planned=afgSlotsPlanned-p0;
+                        const uint64_t accounted=rp+gp+dl+dc+df;
+                        veyra::log::info("afg-slots",std::format("targetFps={:.2f} planned={} real={} generated={} droppedLate={} droppedCapacity={} droppedFailed={} missing={} overloadPairs={} presentedFps={:.2f} displayHz={:.3f} aboveRefresh={} (per-slot ledger for this window: a slot is real, generated, or dropped with a reason; missing = asked for but never accounted for)",
+                            targetFps,planned,rp,gp,dl,dc,df,planned>accounted?planned-accounted:0,
+                            afgOverloadPairs,double(rp+gp),refreshHz,refreshHz>1.0&&targetFps>refreshHz+0.5?1:0));
+                        p0=afgSlotsPlanned;r0=afgSlotsRealPresented;g0=afgSlotsGeneratedPresented;
+                        l0=afgSlotsDroppedLate;c0=afgSlotsDroppedCapacity;f0=afgSlotsDroppedFailed;
+                    }
                 }
                 if(!processed){
                     const auto failedComponent=graph->failedBackend();
@@ -3914,7 +3995,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
 #ifdef VEYRA_ENABLE_XBOX
                         &xb,
 #endif
-                        &seekDecoded,&seekStarted,&seekDemuxDone,&audio,&audioPipe,&audioStarted,&cadence,&ctx,&fileAudioAlignPending,&fileAwaitingVideo,&fileInputEnded,&generatedDropCap,&generatedDropCapacity,&generatedDropDeadline,&playbackRate,&frameFlow,&graph,&host100ns,&isCapture,&isImage,&liveArrival,&livePresent,&liveScheduler,&nextFgDeadlineLog,&nowMs,&options,&pendingCompletions,&physicalCapture,&processingGraph,&presentEntryDeviation,&presentReturnDeviation,&presentationEffective,&presentationGeneration,&presentationSkippedGenerated,&presenter,&ring,&runSessionId,&seekPreviewPending,&observeFrameReady,&traceSubframe,&traceCpu,&captureStarting,&rawFirstPresent,&lastRawPresent,&firstEnhancedRevision,&retiredCapturePreview,&capturePreviewWindow,&rawSurfaceRevealed,privateTrace,traceSubframes,watch,step,timeline,captureArrival,sourceArrivalHost=pkt.arrivalHost100ns,baselineReady,delayEnhanced,activeSeekId,lineage,jobGeneration,rereadCached,sourceIntervalMs,submitThenPresent,generatedGrace=liveGeneratedGrace,smoothedCapacity=smoothTransportAnchor||smoothContentAnchor,halfRate,captureClockCorrected,driverPts100ns,flow=frameFlow,&deadlineMargin,marginPair,pairExtra,&afgPace,&afgLateGenerated,&afgLateReal,&fixedTarget](int64_t now)->LiveGpuScheduler::Step{
+                        &seekDecoded,&seekStarted,&seekDemuxDone,&audio,&audioPipe,&audioStarted,&cadence,&ctx,&fileAudioAlignPending,&fileAwaitingVideo,&fileInputEnded,&generatedDropCap,&generatedDropCapacity,&generatedDropDeadline,&playbackRate,&frameFlow,&graph,&host100ns,&isCapture,&isImage,&liveArrival,&livePresent,&liveScheduler,&nextFgDeadlineLog,&nowMs,&options,&pendingCompletions,&physicalCapture,&processingGraph,&presentEntryDeviation,&presentReturnDeviation,&presentationEffective,&presentationGeneration,&presentationSkippedGenerated,&presenter,&ring,&runSessionId,&seekPreviewPending,&observeFrameReady,&traceSubframe,&traceCpu,&captureStarting,&rawFirstPresent,&lastRawPresent,&firstEnhancedRevision,&retiredCapturePreview,&capturePreviewWindow,&rawSurfaceRevealed,privateTrace,traceSubframes,watch,step,timeline,captureArrival,sourceArrivalHost=pkt.arrivalHost100ns,baselineReady,delayEnhanced,activeSeekId,lineage,jobGeneration,rereadCached,sourceIntervalMs,submitThenPresent,generatedGrace=liveGeneratedGrace,smoothedCapacity=smoothTransportAnchor||smoothContentAnchor,halfRate,captureClockCorrected,driverPts100ns,flow=frameFlow,&deadlineMargin,marginPair,pairExtra,&afgPace,&afgLateGenerated,&afgLateReal,&fixedTarget,&fixedPlanPtr,refreshHz,afgTrace,&afgSlotsPlanned,&afgSlotsRealPresented,&afgSlotsGeneratedPresented,&afgSlotsDroppedLate,&afgSlotsDroppedCapacity,&afgSlotsDroppedFailed,&afgOverloadPairs](int64_t now)->LiveGpuScheduler::Step{
 
                         using State=LiveGpuScheduler::State;auto& batch=watch->output;auto& s=*step;
                         auto updatePending=[&](LiveStepState*){
@@ -3961,9 +4042,13 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                             }
                             if(readiness==PreviewFrameReadiness::Invalid){
                                 if(privateTrace)traceSubframe(diagnostics::TraceKind::Discarded,batch.batch,item,decisionTime,unsigned(readiness),0,"Invalid",false);
+                                if(fixedTarget.config().enabled)++afgSlotsDroppedFailed;
                                 ++s.handled;++s.next;s.deadlineStart.reset();continue;
                             }
-                            if(readiness==PreviewFrameReadiness::Suppressed){++presentationSkippedGenerated;++s.next;s.deadlineStart.reset();continue;}
+                            if(readiness==PreviewFrameReadiness::Suppressed){
+                                if(fixedTarget.config().enabled)++afgSlotsDroppedFailed;
+                                ++presentationSkippedGenerated;++s.next;s.deadlineStart.reset();continue;
+                            }
                             if(isCapture&&readiness==PreviewFrameReadiness::Ready&&!s.readyReported){
                                 s.readyMs=elapsedMs(s.readyStart);s.readyReported=true;flow->cpu(diagnostics::CpuStage::ReadyWait,s.readyMs,host100ns());
                                 if(privateTrace)traceCpu("ReadyWait",batch.batch,decisionTime,s.readyMs);
@@ -3974,7 +4059,9 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 veyra::log::info("fg-deadline",std::format("revision={} batch={} subframe={} expired={} readyObservedLateMs={:.3f} decisionLateMs={:.3f} observedReadyToDecisionMs={:.3f} batchReady={} (CPU fence observations, not scanout; -1 means readiness unknown)",item.identity.settingsRevision,batch.batch.batchId,item.subframe,generationExpired,ready?double(ready-timeline.deadline(item.pts100ns))/10000:-1,double(decisionTime-timeline.deadline(item.pts100ns))/10000,ready?double(decisionTime-ready)/10000:-1,watch->ready.load()));
                                 veyra::log::info("fg-drops",std::format("revision={} deadline={} capacity={} cap={} graceMs={:.1f} (session totals of frames dropped before Present, by reason)",item.identity.settingsRevision,generatedDropDeadline,generatedDropCapacity,generatedDropCap,double(generatedGrace)/10000));
                             }
-                            if(readiness==PreviewFrameReadiness::Expired){++generatedDropDeadline;++s.dropped;++s.handled;++s.next;s.deadlineStart.reset();s.capacityStart.reset();continue;}
+                            if(readiness==PreviewFrameReadiness::Expired){
+                                if(fixedTarget.config().enabled)++afgSlotsDroppedLate;
+                                ++generatedDropDeadline;++s.dropped;++s.handled;++s.next;s.deadlineStart.reset();s.capacityStart.reset();continue;}
                             if(!s.deadlineStart)s.deadlineStart=Clock::now();
                             if(isCapture){if(host100ns()<timeline.deadline(item.pts100ns))return {State::Pending,timeline.deadline(item.pts100ns),timeline.paced()&&!presenter->providerOwnedPresentation()};}
                             else if(!fileAwaitingVideo){
@@ -4007,6 +4094,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 // instead of accumulating latency.
                                 if(capInterval>0&&cadence.rateSkipsCandidate(optionalNow,mediaDeadline,interval,capInterval)){
                                     if(privateTrace)traceSubframe(diagnostics::TraceKind::Discarded,batch.batch,item,optionalNow,0,0,"OutputRateCap",false);
+                                    if(fixedTarget.config().enabled)++afgSlotsDroppedCapacity;
                                     ++generatedDropCap;++s.dropped;++s.handled;++s.next;s.deadlineStart.reset();continue;
                                 }
                                 if(optionalNow<due)return {State::Pending,due};
@@ -4033,6 +4121,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                     const auto capacityWait=elapsedMs(*s.capacityStart);
                                     if(capacityWait>s.capacityWaitMs){
                                         if(privateTrace)traceSubframe(diagnostics::TraceKind::Discarded,batch.batch,item,optionalNow,0,capacityWait,"DisplayCapacity",false);
+                                        if(fixedTarget.config().enabled)++afgSlotsDroppedCapacity;
                                         ++generatedDropCapacity;++s.dropped;++s.handled;++s.next;s.deadlineStart.reset();s.capacityStart.reset();continue;
                                     }
                                 }
@@ -4068,6 +4157,34 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 // work. The bounded scheduler retains that pressure.
                             }
                             if(didPresent){
+                                if(fixedTarget.config().enabled){
+                                    if(generated)++afgSlotsGeneratedPresented;else ++afgSlotsRealPresented;
+                                    if(afgTrace){
+                                        // One line per output frame: the chain the spec
+                                        // asks to be traceable. slot/timestep come from
+                                        // the plan, ready/present from this thread, and
+                                        // lateness is measured against the frame's own
+                                        // slot - not against its neighbour.
+                                        const auto readyAt=watch->frameReadyObserved[s.next];
+                                        const double lateMs=isCapture&&timeline.paced()?
+                                            double(presentBeginHost-timeline.deadline(item.pts100ns))/10000.0:
+                                            (deviationValid?entryDeviation:0.0);
+                                        long long slot=0;double step=0.0;
+                                        if(fixedPlanPtr&&!fixedPlanPtr->bypass){
+                                            if(generated){
+                                                for(unsigned k=0;k<fixedPlanPtr->count;++k){
+                                                    const int64_t d=fixedPlanPtr->pts100ns[k]-item.pts100ns;
+                                                    if(d>-1000&&d<1000){slot=fixedPlanPtr->slotIndex[k];step=fixedPlanPtr->timestep[k];break;}
+                                                }
+                                            }else slot=fixedPlanPtr->realSlot;
+                                        }
+                                        veyra::log::info("afg-frame",std::format("source={} kind={} subframe={} slot={} ptsMs={:.3f} timestep={:.4f} guardMs={:.3f} readyMs={:.3f} presentMs={:.3f} lateMs={:.3f} displayHz={:.3f} (slot = grid index, ptsMs = the slot it left on, readyMs = ready before Present in ms (-1000 = not observed), presentMs = since the first present, lateMs = Present against that slot)",
+                                            item.identity.sourceFrameId,generated?"generated":"real",item.subframe,slot,
+                                            double(item.pts100ns)/10000.0,step,double(fixedPlanPtr?fixedPlanPtr->guard100ns:0)/10000.0,
+                                            readyAt?double(readyAt-presentBeginHost)/10000.0:-1000.0,
+                                            double(presentBeginHost-rawFirstPresent)/10000.0,lateMs,refreshHz));
+                                    }
+                                }
                                 if(!rawSurfaceRevealed&&retiredCapturePreview&&retiredCapturePreview->presenter){
                                     capturePreviewWindow.hide();
                                     rawSurfaceRevealed=true;

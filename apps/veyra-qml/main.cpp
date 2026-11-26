@@ -1070,6 +1070,24 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
                 else { bridge.setOutputRateMode(2); bridge.setOutputCustomFps(cap.toDouble()); }
                 veyra::log::info("qml-test", std::format("output cap: {}", cap.toStdString()));
             });
+        } else if (a == QLatin1String("--card")) {
+            // Test switch: deliver the file through the capture-card timing path
+            // (pair anchors, arrival clock, paced deadlines) instead of the audio
+            // clock of file playback. AFG has to be accepted on the path a PS5 +
+            // capture card actually takes, and that path is a different scheduler.
+            SetEnvironmentVariableW(L"VEYRA_TEST_CAPTURE_REPLAY", L"1");
+            SetEnvironmentVariableW(L"VEYRA_TEST_REPLAY_AS_CARD", L"1");
+            veyra::log::info("qml-test", "replay delivered as a capture card (live scheduler, no audio clock)");
+        } else if (a == QLatin1String("--sync") && hasValue) {
+            // Test switch: presentation sync, `tearing` (no vsync gating) or `vsync`.
+            // A vsynced chain can only leave on vblank boundaries, so measuring the
+            // scheduler's cadence through it is not measuring the scheduler.
+            const QString sync = args.at(++i);
+            const int value = sync == QLatin1String("tearing") ? 0 : sync == QLatin1String("vsync") ? 1 : 2;
+            QTimer::singleShot(0, &bridge, [&bridge, value, sync] {
+                bridge.setDisplaySync(value);
+                veyra::log::info("qml-test", std::format("display sync: {}", sync.toStdString()));
+            });
         } else if (a == QLatin1String("--afg") && hasValue) {
             // Test switch: the whole AFG setup through the same bridge entry points
             // the panel uses (backend -> multiplier floor -> mode -> rate -> cadence

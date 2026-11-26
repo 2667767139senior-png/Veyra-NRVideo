@@ -167,6 +167,19 @@ QString QmlPlayerBridge::afgStatusText() const {
                      .arg(a.lateGenP95Ms, 0, 'f', 2).arg(a.lateRealP95Ms, 0, 'f', 2);
     lines << tr("丢槽 上限 %1 · 过近 %2 · GPU %3 · 重锚定 %4")
                  .arg(a.droppedCap).arg(a.droppedNear).arg(a.droppedLoad).arg(a.resyncs);
+    // The slot ledger. A rate can be right while slots are missing, so the number
+    // that matters is the last column: slots the grid asked for and never got.
+    if (a.slotsPlanned > 0)
+        lines << tr("槽位 %1 个：真实 %2 · 生成 %3 · 过期丢 %4 · 产能丢 %5 · 失败 %6 · 缺失 %7")
+                     .arg(a.slotsPlanned).arg(a.slotsRealPresented).arg(a.slotsGeneratedPresented)
+                     .arg(a.slotsDroppedLate).arg(a.slotsDroppedCapacity)
+                     .arg(a.slotsDroppedFailed).arg(a.slotsMissing);
+    if (a.overloadPairs > 0)
+        lines << tr("过载 %1 次：GPU 来不及的生成槽位已单独标记，没有伪装成有效补帧").arg(a.overloadPairs);
+    // Presenting 50 FPS is not showing 50 FPS. Say which one this panel can do.
+    if (a.targetAboveRefresh)
+        lines << tr("注意：显示器 %1 Hz，低于目标 %2 FPS，实际扫描出的帧数达不到目标（这不是调度问题，换显示器或降低目标）")
+                     .arg(a.displayHz, 0, 'f', 0).arg(a.targetFps, 0, 'f', 0);
     if (a.fgGpuP95Ms > 0.05)
         lines << tr("VFG %1 ms/帧 · 目标周期 %2 ms · 旁路 长间隔 %3 / 已达目标 %4")
                      .arg(a.fgGpuP95Ms, 0, 'f', 2).arg(a.periodMs, 0, 'f', 1)
