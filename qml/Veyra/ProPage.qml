@@ -2075,6 +2075,60 @@ VPage {
                                 }
                             }
                             VRow {
+                                objectName: "list-fg-fixed-target-buffer"
+                                label: qsTr("缓冲策略")
+                                visible: veyra.fgFixedTarget
+                                hint: veyra.fgFixedTargetBuffer === 0
+                                      ? qsTr("紧凑：超过 60 ms 的输入间隔当作卡顿直接放弃插值；每个间隔最多生成 2 帧。延迟最低，最不容易积压，高目标帧率时会丢槽位")
+                                      : veyra.fgFixedTargetBuffer === 2
+                                        ? qsTr("宽松：超过 250 ms 才算卡顿；每帧按目标帧率决定生成几帧（最多 7）。卡顿后画面更连续，但恢复时那一对更吃 GPU")
+                                        : qsTr("平衡：超过 100 ms 算卡顿；每帧按目标帧率决定生成几帧（最多 7）。三种策略都不会让帧堆积成延迟")
+                                VSeg {
+                                    objectName: "list-fg-fixed-target-buffer-seg"
+                                    options: [{id:"0",label:qsTr("紧凑")},{id:"1",label:qsTr("平衡")},{id:"2",label:qsTr("宽松")}]
+                                    current: String(veyra.fgFixedTargetBuffer)
+                                    onPicked: id => veyra.fgFixedTargetBuffer = Number(id)
+                                }
+                            }
+                            VRow {
+                                objectName: "list-fg-fixed-target-gpu-adapt"
+                                label: qsTr("GPU 负载自适应")
+                                visible: veyra.fgFixedTarget
+                                hint: qsTr("用实测的 VFG 每帧耗时分摊输出周期，算出这个间隔实际能生成几帧；算下来不够时就少生成（记在「丢槽 GPU」里），而不是让帧积压成延迟。它只会在算下来不够时下调，GPU 跑得动时不会动")
+                                VSwitch {
+                                    objectName: "list-fg-fixed-target-gpu-adapt-switch"
+                                    checked: veyra.fgFixedTargetGpuAdapt
+                                    onToggled: checked => veyra.fgFixedTargetGpuAdapt = checked
+                                }
+                            }
+                            VRow {
+                                objectName: "list-fg-fixed-target-fallback"
+                                label: qsTr("回退策略")
+                                visible: veyra.fgFixedTarget
+                                hint: veyra.fgFixedTargetFallback
+                                      ? qsTr("Timestep 生成失败时，同一对改按普通 2 倍位置再试一次，并保留网格上的时间戳：位置差一帧，但节奏不断。日志会记 target=timestep-fallback")
+                                      : qsTr("Timestep 生成失败就按补帧失败处理（走引擎原有的补帧故障恢复），不留位置不对的帧")
+                                VSwitch {
+                                    objectName: "list-fg-fixed-target-fallback-switch"
+                                    checked: veyra.fgFixedTargetFallback
+                                    onToggled: checked => veyra.fgFixedTargetFallback = checked
+                                }
+                            }
+                            // AFG status: measured, once a second. Source / generated /
+                            // submit are three separate numbers; the target is never
+                            // printed in their place, and no "display FPS" is invented.
+                            Text {
+                                objectName: "list-fg-fixed-target-status"
+                                Layout.fillWidth: true
+                                Layout.topMargin: 2
+                                visible: veyra.fgFixedTarget && veyra.afgStatusText.length > 0
+                                text: veyra.afgStatusText
+                                wrapMode: Text.WordWrap
+                                color: veyra.afgStatusActive ? Theme.t2 : Theme.warn
+                                font.family: Theme.fontUi; font.pixelSize: 11
+                                lineHeight: 1.25
+                            }
+                            VRow {
                                 objectName: "list-pacing-repair"
                                 label: qsTr("帧节奏修复")
                                 visible: veyra.fgBackendName !== "xess"

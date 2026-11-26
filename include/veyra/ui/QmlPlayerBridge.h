@@ -491,6 +491,16 @@ class QmlPlayerBridge : public QObject {
     // 0 = fixed cadence (real frames snapped onto the output grid), 1 = latency
     // (real frames keep their own timestamps, only the gaps are filled).
     Q_PROPERTY(int fgFixedTargetCadence READ fgFixedTargetCadence WRITE setFgFixedTargetCadence NOTIFY settingsChanged)
+    // 0 = tight (60 ms stall, at most two frames per pair), 1 = balanced (100 ms,
+    // rate-derived cap), 2 = relaxed (250 ms, rate-derived cap).
+    Q_PROPERTY(int fgFixedTargetBuffer READ fgFixedTargetBuffer WRITE setFgFixedTargetBuffer NOTIFY settingsChanged)
+    Q_PROPERTY(bool fgFixedTargetGpuAdapt READ fgFixedTargetGpuAdapt WRITE setFgFixedTargetGpuAdapt NOTIFY settingsChanged)
+    Q_PROPERTY(bool fgFixedTargetFallback READ fgFixedTargetFallback WRITE setFgFixedTargetFallback NOTIFY settingsChanged)
+    // What the running scheduler actually did, once a second: source / generated /
+    // submit rate, present interval percentiles, dropped slots and the gate that
+    // kept the mode from running. Empty when the mode is off.
+    Q_PROPERTY(QString afgStatusText READ afgStatusText NOTIFY snapshotChanged)
+    Q_PROPERTY(bool afgStatusActive READ afgStatusActive NOTIFY snapshotChanged)
     // True when the fixed-target mode can actually run (VFG backend). The mode row
     // stays visible either way and explains itself when this is false.
     Q_PROPERTY(bool fgFixedTargetAvailable READ fgFixedTargetAvailable NOTIFY settingsChanged)
@@ -1213,6 +1223,14 @@ public:
     void setFgFixedTargetFps(int value);
     int fgFixedTargetCadence() const;
     void setFgFixedTargetCadence(int value);
+    int fgFixedTargetBuffer() const;
+    void setFgFixedTargetBuffer(int value);
+    bool fgFixedTargetGpuAdapt() const;
+    void setFgFixedTargetGpuAdapt(bool value);
+    bool fgFixedTargetFallback() const;
+    void setFgFixedTargetFallback(bool value);
+    QString afgStatusText() const;
+    bool afgStatusActive() const;
     bool fgFixedTargetAvailable() const;
     bool dynamicHud() const;
     void setDynamicHud(bool value);

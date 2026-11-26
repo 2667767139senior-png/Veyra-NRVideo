@@ -299,9 +299,22 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             if (p.contains(QStringLiteral("fgFixedTargetCadence")))
                 fixed.cadence = p.value(QStringLiteral("fgFixedTargetCadence")).toInt() == 1
                     ? engine::FixedTargetCadence::Latency : engine::FixedTargetCadence::Fixed;
+            if (p.contains(QStringLiteral("fgFixedTargetBuffer"))) {
+                const int buffer = p.value(QStringLiteral("fgFixedTargetBuffer")).toInt();
+                fixed.buffer = buffer == 0 ? engine::FixedTargetBufferPolicy::Tight
+                             : buffer == 2 ? engine::FixedTargetBufferPolicy::Relaxed
+                                           : engine::FixedTargetBufferPolicy::Balanced;
+            }
+            if (p.contains(QStringLiteral("fgFixedTargetGpuAdapt")))
+                fixed.gpuLoadAdapt = p.value(QStringLiteral("fgFixedTargetGpuAdapt")).toBool();
+            if (p.contains(QStringLiteral("fgFixedTargetFallback")))
+                fixed.fallbackMultiplier = p.value(QStringLiteral("fgFixedTargetFallback")).toBool();
             // The run cap is derived, not stored: a profile from before the panel
-            // took arbitrary rates still has the historical four.
-            fixed.maxRuns = engine::fixedTargetRunsFor(fixed.targetFps);
+            // took arbitrary rates still has the historical four. The buffer policy
+            // and the stall threshold follow from it, so a stored pair that
+            // disagrees with its own policy is normalised rather than rejected.
+            fixed.maxRuns = engine::fixedTargetPolicyCap(fixed.buffer, engine::fixedTargetRunsFor(fixed.targetFps));
+            fixed.maxIntervalMs = engine::fixedTargetStallMs(fixed.buffer);
             // Only VFG can run it. A profile restored together with another backend
             // would otherwise come back with the mode selected and greyed out.
             if (fixed.enabled && s.frameGenerationBackend != engine::FrameGenerationBackend::Vfg) fixed.enabled = false;

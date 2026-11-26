@@ -4742,8 +4742,18 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             // 2X evaluation (timestep 0 = FrameMultiplier path).
             const double timestep=!resetFg&&fixedTarget&&sub<=fixedPlan->count?
                 fixedPlan->timestep[sub-1]:0.0;
-            if(!vfgBackend_->generate(parity,sub,resetFg?2u:outputMultiplier,resetFg,out.fgFast,
-                    timestep,-1)){failedBackend_=engine::FailedBackend::Fg;return false;}
+            bool fgOk=vfgBackend_->generate(parity,sub,resetFg?2u:outputMultiplier,resetFg,out.fgFast,
+                    timestep,-1);
+            if(!fgOk&&timestep>0.0&&afgFallbackMultiplier_){
+                // AFG fallback policy (ui: 回退策略). Only the selector is new here,
+                // so retry the same pair at the plain 2X position. The frame keeps its
+                // grid timestamp below: an output slot at the wrong position is a
+                // one-frame position error, while a failed pair is a hole in the
+                // cadence - the failure this whole mode exists to prevent.
+                veyra::log::warn("vfg",std::format("target=timestep-fallback sub={} t={:.3f} (explicit timestep failed; retried at 2X)",sub,timestep));
+                fgOk=vfgBackend_->generate(parity,sub,2u,resetFg,out.fgFast,0.0,-1);
+            }
+            if(!fgOk){failedBackend_=engine::FailedBackend::Fg;return false;}
             auto* flist=ring_->acquireNext(slot,st);if(!flist)return false;
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COPY_DEST);
             if(!vfgBackend_->copyOutput(flist,genFrame_[generatedSlot].Get(),generatedSlot)){failedBackend_=engine::FailedBackend::Fg;return false;}

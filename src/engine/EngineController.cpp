@@ -3210,6 +3210,10 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     options.settings.frameGenerationBackend==FrameGenerationBackend::Vfg&&
                     !isImage&&!presentSinkFrameGeneration(options.settings.frameGenerationBackend)&&
                     graph->vfgTimestepAvailable();
+                // Published AFG status from a previous frame: cleared when the mode is
+                // turned off, so the panel never shows the last run's numbers as if
+                // they were still being measured.
+                static bool afgStatusPublished=false;
                 // The mode, the rate and the smoothing knobs cannot be read from the
                 // settings revision: they are exempt from the rebuild comparison, so
                 // editing them mid-play does NOT bump it. Compare the struct instead.
@@ -3226,14 +3230,33 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     // feature does nothing": the mode is on, the panel hides the
                     // multiplier, and some gate below never let it in. Name the gate.
                     static uint64_t nextFixedTargetRefusalLog=0;
+                    // The same gate, once for the panel: the status block has to say
+                    // why it is idle, not just show zeros.
+                    const bool timestepOk=graph->vfgTimestepAvailable();
+                    {
+                        std::lock_guard lock(mutex_);
+                        auto& afg=snapshot_.afg;
+                        afg=AfgStatus{};
+                        afg.targetFps=options.settings.fgFixedTarget.targetFps;
+                        afg.blocked=!options.fg?"fg off":
+                            options.settings.frameGenerationBackend!=FrameGenerationBackend::Vfg?"backend is not VFG":
+                            isImage?"image source":
+                            presentSinkFrameGeneration(options.settings.frameGenerationBackend)?"present sink owns frame generation":
+                            !timestepOk?"VFG core has no Timestep parameter":"waiting for the second frame";
+                    }
                     if(host100ns()>=nextFixedTargetRefusalLog){
                         nextFixedTargetRefusalLog=host100ns()+10000000;
                         veyra::log::warn("fixed-target",std::format("mode=on but not running: fg={} backend={} image={} presentSink={} liveMultiplier={} usesFg={} timestep={} (fix the named gate; the mode itself is enabled. timestep=0 means the installed VFG core has no Timestep parameter, which AFG requires)",
                             options.fg?1:0,int(options.settings.frameGenerationBackend),isImage?1:0,
                             presentSinkFrameGeneration(options.settings.frameGenerationBackend)?1:0,
                             options.settings.liveMultiplier(),options.settings.usesFrameGeneration()?1:0,
-                            graph->vfgTimestepAvailable()?1:0));
+                            timestepOk?1:0));
                     }
+                    afgStatusPublished=true;
+                }else if(afgStatusPublished){
+                    std::lock_guard lock(mutex_);
+                    snapshot_.afg=AfgStatus{};
+                    afgStatusPublished=false;
                 }
                 // Live output hint: the panel cannot show more than one new picture
                 // per refresh, so suggest a multiplier that fits (DisplayFgBudget.h).
@@ -3482,6 +3505,9 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     processWaitBase=ring.cpuWaitCount();processWaitMsBase=ring.cpuWaitMilliseconds();processSubmitBase=ring.submitCount();
                     processingGraph=true;
                     {OnExit processingDone{[&]{processingGraph=false;}};
+                    // AFG fallback policy is a per-pair decision in the graph, so it is
+                    // pushed every frame instead of rebuilding on a toggle (a bool store).
+                    graph->setAfgFallbackMultiplier(options.settings.fgFixedTarget.fallbackMultiplier);
                     // The first checkpoint: a frame due before the graph's first one.
                     if(!historyReset)presentDuringProcess();
                     processed=!injectedReject&&graph->process(frame,pts,historyReset,out,pkt.sequence,&pkt.colorInfo,&pkt.hardwareSurface,comparisonMode_!=0,admitFg,previewFgMultiplier,(paused_||isImage)&&transaction,presentDuringProcess,pkt.doviEl,&pkt.doviP7,fixedPlanPtr);}
@@ -3497,6 +3523,46 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         options.settings.fgFixedTarget.targetFps,pace.samples,pace.p50,pace.p95,pace.p99,pace.mean,pace.stddev,pace.offCadence));
                     nextFixedTargetLog=host100ns()+10000000;
                     const auto& st=fixedTarget.stats();
+                    // GPU load adaptation: how many generated frames one input
+                    // interval can actually afford, from VFG's measured per-Run
+                    // cost (Fg1 P95) rather than from a guess. The scheduler only
+                    // ever lowers a pair's count with this, so a GPU that can meet
+                    // the target is never affected.
+                    const auto fgP95=(frameFlow?frameFlow->snapshot(host100ns(),false).gpuTiming[size_t(diagnostics::GpuStage::Fg1)].p95:0.0);
+                    const double targetFps=options.settings.fgFixedTarget.targetFps;
+                    const double spanMs=st.lastSpanMs>0.0?st.lastSpanMs:(targetFps>0.5?1000.0/targetFps:33.3);
+                    unsigned affordable=kFixedTargetMaxTicks;
+                    if(std::isfinite(fgP95)&&fgP95>0.05&&spanMs>0.0)
+                        affordable=std::clamp(unsigned(std::floor(spanMs/fgP95)),1u,kFixedTargetMaxTicks);
+                    fixedTarget.setLoadCap(options.settings.fgFixedTarget.gpuLoadAdapt?affordable:0u);
+                    // Generated frames per second of source time. Measured between
+                    // two log ticks, so a broken cadence cannot hide behind the
+                    // target: this is what the scheduler really inserted.
+                    static int64_t afgRatePts100ns=0;
+                    static uint64_t afgRateGenerated=0;
+                    static double afgRateFps=0;
+                    const int64_t nowPts100ns=int64_t(std::llround(pts*10000.0));
+                    if(afgRatePts100ns>0&&nowPts100ns>afgRatePts100ns&&st.generated>=afgRateGenerated)
+                        afgRateFps=double(st.generated-afgRateGenerated)*1e7/double(nowPts100ns-afgRatePts100ns);
+                    afgRatePts100ns=nowPts100ns;afgRateGenerated=st.generated;
+                    {
+                        std::lock_guard lock(mutex_);
+                        auto& afg=snapshot_.afg;
+                        afg.active=true;afg.blocked.clear();
+                        afg.targetFps=targetFps;
+                        afg.latencyCadence=options.settings.fgFixedTarget.cadence==FixedTargetCadence::Latency;
+                        afg.periodMs=targetFps>0.5?1000.0/targetFps:0.0;
+                        afg.sourceFps=pairContentFps;
+                        afg.generatedFps=afgRateFps;
+                        afg.snapMs=st.lastSnapMs;
+                        afg.generated=st.generated;afg.droppedCap=st.droppedCap;afg.droppedNear=st.droppedNear;
+                        afg.droppedLoad=st.droppedLoad;afg.resyncs=st.resyncs;
+                        afg.bypassLong=st.bypassLong;afg.bypassAtTarget=st.bypassAtTarget;afg.bypassOff=st.bypassOff;
+                        afg.paceSamples=pace.samples;afg.offCadence=pace.offCadence;
+                        afg.p50Ms=pace.p50;afg.p95Ms=pace.p95;afg.p99Ms=pace.p99;afg.stddevMs=pace.stddev;
+                        afg.fgGpuP95Ms=fgP95;
+                    }
+                    afgStatusPublished=true;
                     // One line per second, enough to reconstruct the grid: slot times
                     // and timesteps of this pair, the snap that cadence policy added,
                     // and the counters that must stay flat when the output is healthy.
@@ -3504,13 +3570,16 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     for(unsigned i=0;i<fixedPlanPtr->count&&i<4;++i)
                         slots+=std::format("{}{:.3f}@{:.3f}ms",i?",":"",
                             fixedPlanPtr->timestep[i],double(fixedPlanPtr->pts100ns[i])/10000.0);
-                    veyra::log::info("fixed-target",std::format("revision={} mode=afg targetFps={:.2f} cadence={} contentFps={:.2f} sourceMs={:.3f} periodMs={:.3f} frames={} timestep[{}/{}]={} realSlotMs={:.3f} snapMs={:.3f} bypass={} reason={} intervals={} generated={} droppedCap={} droppedNear={} bypassLong={} bypassAtTarget={} bypassOff={} (frames = generated frames this pair; timestep[i]@ms = VFG Timestep and grid presentation time; realSlotMs = presentation time of the real frame; snapMs = delay the fixed cadence added to it)",
+                    veyra::log::info("fixed-target",std::format("revision={} mode=afg targetFps={:.2f} cadence={} buffer={} contentFps={:.2f} sourceMs={:.3f} periodMs={:.3f} frames={} timestep[{}/{}]={} realSlotMs={:.3f} snapMs={:.3f} generatedFps={:.2f} fgGpuP95Ms={:.3f} loadCap={} bypass={} reason={} intervals={} generated={} droppedCap={} droppedNear={} droppedLoad={} loadLimitedPairs={} resyncs={} bypassLong={} bypassAtTarget={} bypassOff={} (frames = generated frames this pair; timestep[i]@ms = VFG Timestep and grid presentation time; realSlotMs = presentation time of the real frame; snapMs = delay the fixed cadence added to it; loadCap = frames per pair the measured GPU cost affords, applied only when below maxRuns; generatedFps is measured, not the target)",
                         options.settings.revision,options.settings.fgFixedTarget.targetFps,
                         options.settings.fgFixedTarget.cadence==FixedTargetCadence::Latency?"latency":"fixed",
+                        options.settings.fgFixedTarget.buffer==FixedTargetBufferPolicy::Tight?"tight":
+                        options.settings.fgFixedTarget.buffer==FixedTargetBufferPolicy::Relaxed?"relaxed":"balanced",
                         pairContentFps,st.lastSpanMs,st.lastPeriodMs,
                         fixedPlanPtr->count,fixedPlanPtr->count,fixedPlanPtr->outputMultiplier-1,slots,
                         double(fixedPlanPtr->realPts100ns>0?fixedPlanPtr->realPts100ns:0)/10000.0,st.lastSnapMs,
-                        fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.generated,st.droppedCap,st.droppedNear,st.bypassLong,st.bypassAtTarget,st.bypassOff));
+                        afgRateFps,fgP95,fixedTarget.effectiveMaxRuns(),
+                        fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.generated,st.droppedCap,st.droppedNear,st.droppedLoad,st.loadLimitedPairs,st.resyncs,st.bypassLong,st.bypassAtTarget,st.bypassOff));
                 }
                 if(!processed){
                     const auto failedComponent=graph->failedBackend();

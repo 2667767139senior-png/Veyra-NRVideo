@@ -923,11 +923,17 @@ public:
     bool vfgFastReady() const;
     // False when the installed VFG core has no Timestep parameter. AFG needs it.
     bool vfgTimestepAvailable() const;
+    // AFG fallback policy: when a pair's explicit-timestep evaluation fails, retry
+    // it once at the plain 2X position instead of failing the frame. Set from the
+    // engine with the settings; false reports the failure as before.
+    void setAfgFallbackMultiplier(bool on) { afgFallbackMultiplier_ = on; }
+    bool afgFallbackMultiplier() const { return afgFallbackMultiplier_; }
     engine::FailedBackend failedBackend() const { return failedBackend_; }
 
 private:
     bool nrPreparing_=false;
     bool pendingNrEnabled_=false;
+    bool afgFallbackMultiplier_=true;
     engine::FailedBackend failedBackend_=engine::FailedBackend::None;
     bool createResources();
     bool initZeroAndDepthTextures();

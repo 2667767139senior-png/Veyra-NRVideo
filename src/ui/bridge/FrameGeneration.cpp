@@ -321,10 +321,18 @@ engine::FixedTargetConfig normalizedFixedTarget(engine::FixedTargetConfig c) {
     c.targetFps = std::clamp(std::isfinite(c.targetFps) ? c.targetFps : 50.0, 0.0, 160.0);
     // The cap has to follow the rate the user typed, or 120 FPS and above would
     // arrive capped at four ticks per interval and show up as dropped frames.
-    c.maxRuns = engine::fixedTargetRunsFor(c.targetFps);
+    // The buffer policy then decides how much of that cap one pair may actually
+    // spend, and how long a gap it is willing to interpolate across.
+    c.maxRuns = engine::fixedTargetPolicyCap(c.buffer, engine::fixedTargetRunsFor(c.targetFps));
     if (c.cadence != engine::FixedTargetCadence::Latency) c.cadence = engine::FixedTargetCadence::Fixed;
-    c.maxIntervalMs = std::clamp(std::isfinite(c.maxIntervalMs) ? c.maxIntervalMs : 100.0, 20.0, 1000.0);
-    if (!engine::fixedTargetValid(c)) c.maxIntervalMs = 100.0;
+    c.maxIntervalMs = engine::fixedTargetStallMs(c.buffer);
+    if (!engine::fixedTargetValid(c)) {
+        // A hand-edited profile: fall back to the defaults of its own policy
+        // rather than to whichever field looked wrong.
+        c.buffer = engine::FixedTargetBufferPolicy::Balanced;
+        c.maxRuns = engine::fixedTargetPolicyCap(c.buffer, engine::fixedTargetRunsFor(c.targetFps));
+        c.maxIntervalMs = engine::fixedTargetStallMs(c.buffer);
+    }
     return c;
 }
 }
@@ -357,6 +365,9 @@ bool QmlPlayerBridge::fgFixedTargetAvailable() const {
 }
 int QmlPlayerBridge::fgFixedTargetFps() const { return int(std::lround(settings().fgFixedTarget.targetFps)); }
 int QmlPlayerBridge::fgFixedTargetCadence() const { return int(settings().fgFixedTarget.cadence); }
+int QmlPlayerBridge::fgFixedTargetBuffer() const { return int(settings().fgFixedTarget.buffer); }
+bool QmlPlayerBridge::fgFixedTargetGpuAdapt() const { return settings().fgFixedTarget.gpuLoadAdapt; }
+bool QmlPlayerBridge::fgFixedTargetFallback() const { return settings().fgFixedTarget.fallbackMultiplier; }
 // Rate and cadence only feed the per-pair plan: no rebuild, and a rejected
 // commit restores the panel because settingsChanged re-reads the applied values.
 void QmlPlayerBridge::commitFixedTarget(engine::FixedTargetConfig next, const char* what) {
@@ -382,12 +393,20 @@ void QmlPlayerBridge::commitFixedTarget(engine::FixedTargetConfig next, const ch
         " targetFps=" + std::to_string(int(std::lround(next.targetFps))) +
         " maxRuns=" + std::to_string(next.maxRuns) +
         " cadence=" + std::string(next.cadence == engine::FixedTargetCadence::Latency ? "latency" : "fixed") +
+        " buffer=" + std::string(next.buffer == engine::FixedTargetBufferPolicy::Tight ? "tight" :
+                                 next.buffer == engine::FixedTargetBufferPolicy::Relaxed ? "relaxed" : "balanced") +
+        " stallMs=" + std::to_string(int(std::lround(next.maxIntervalMs))) +
+        " gpuAdapt=" + std::to_string(next.gpuLoadAdapt ? 1 : 0) +
+        " fallback=" + std::to_string(next.fallbackMultiplier ? 1 : 0) +
         " multiplier=" + std::to_string(live.multiplier) +
         " backend=" + std::to_string(int(live.frameGenerationBackend)) +
         " (multiplier is only the pool floor here; the per-pair count sets the real width)");
     impl_->prefs[QStringLiteral("fgFixedTarget")] = next.enabled;
     impl_->prefs[QStringLiteral("fgFixedTargetFps")] = int(std::lround(next.targetFps));
     impl_->prefs[QStringLiteral("fgFixedTargetCadence")] = int(next.cadence);
+    impl_->prefs[QStringLiteral("fgFixedTargetBuffer")] = int(next.buffer);
+    impl_->prefs[QStringLiteral("fgFixedTargetGpuAdapt")] = next.gpuLoadAdapt;
+    impl_->prefs[QStringLiteral("fgFixedTargetFallback")] = next.fallbackMultiplier;
     if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", std::string("fixed-target ")+what+" not saved");
     emit settingsChanged();
 }
@@ -405,6 +424,25 @@ void QmlPlayerBridge::setFgFixedTargetCadence(int value) {
     auto next = settings().fgFixedTarget;
     next.cadence = value == 1 ? engine::FixedTargetCadence::Latency : engine::FixedTargetCadence::Fixed;
     commitFixedTarget(next, "cadence");
+}
+void QmlPlayerBridge::setFgFixedTargetBuffer(int value) {
+    auto next = settings().fgFixedTarget;
+    // A buffer policy change moves maxRuns, which sizes the generated pool, so this
+    // one does rebuild the graph - and the panel says so in its hint.
+    next.buffer = value == 2 ? engine::FixedTargetBufferPolicy::Relaxed
+                : value == 0 ? engine::FixedTargetBufferPolicy::Tight
+                             : engine::FixedTargetBufferPolicy::Balanced;
+    commitFixedTarget(next, "buffer policy");
+}
+void QmlPlayerBridge::setFgFixedTargetGpuAdapt(bool value) {
+    auto next = settings().fgFixedTarget;
+    next.gpuLoadAdapt = value;
+    commitFixedTarget(next, "gpu adaptation");
+}
+void QmlPlayerBridge::setFgFixedTargetFallback(bool value) {
+    auto next = settings().fgFixedTarget;
+    next.fallbackMultiplier = value;
+    commitFixedTarget(next, "fallback");
 }
 bool QmlPlayerBridge::dynamicHud() const { return settings().dynamicHud; }
 void QmlPlayerBridge::setDynamicHud(bool value) {

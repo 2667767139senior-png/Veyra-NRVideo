@@ -3,6 +3,7 @@
 #include "../LiveTranslation.h"
 
 #include <regex>
+#include <QStringList>
 #include "veyra/pipeline/NrReuse.h"
 
 namespace veyra::ui {
@@ -122,6 +123,47 @@ bool QmlPlayerBridge::submitLowFpsKnown() const { return !xessPresenting(impl_->
 QString QmlPlayerBridge::submitFpsLabel() const { return xessPresenting(impl_->snapshot) ? tr("SDK 提交") : tr("提交"); }
 double QmlPlayerBridge::lateMs() const { return impl_->snapshot.lateMs; }
 double QmlPlayerBridge::lateP95Ms() const { return impl_->snapshot.lateP95Ms; }
+// AFG status (engine/EngineController.h AfgStatus). Three rates, deliberately
+// separate: what the source delivers, what the scheduler inserted, and what we
+// handed to the presenter. None of them is a measured display rate - that number
+// is not observable from here and is therefore not printed.
+bool QmlPlayerBridge::afgStatusActive() const { return impl_->snapshot.afg.active; }
+QString QmlPlayerBridge::afgStatusText() const {
+    const auto& a = impl_->snapshot.afg;
+    if (!a.active) {
+        const QString why = QString::fromStdString(a.blocked);
+        const QString reason =
+            why == QStringLiteral("fg off") ? tr("补帧已关闭") :
+            why == QStringLiteral("backend is not VFG") ? tr("补帧方式不是 NVIDIA VFG") :
+            why == QStringLiteral("image source") ? tr("图片源不补帧") :
+            why == QStringLiteral("present sink owns frame generation") ? tr("呈现端自带补帧，AFG 不接管") :
+            why == QStringLiteral("VFG core has no Timestep parameter") ? tr("当前 VFG 运行库没有 Timestep 参数，AFG 无法工作（请换用支持的 runtime）") :
+            why == QStringLiteral("waiting for the second frame") ? tr("等待第二个真实帧") : why;
+        return reason.isEmpty() ? QString() : tr("AFG 未运行：%1").arg(reason);
+    }
+    QStringList lines;
+    lines << tr("目标 %1 FPS · 输出节奏 %2%3")
+                 .arg(a.targetFps, 0, 'f', 0)
+                 .arg(a.latencyCadence ? tr("低延迟") : tr("固定网格"))
+                 .arg(a.latencyCadence ? QString() : tr("（真实帧最多晚 %1 ms）").arg(a.snapMs, 0, 'f', 1));
+    // Source, generated and submit are three different measurements; the target
+    // rate is never shown in their place.
+    lines << tr("源（实测）%1 · 生成 %2 · 提交 %3 FPS")
+                 .arg(a.sourceFps > 0.05 ? QString::number(a.sourceFps, 'f', 1) : tr("—"))
+                 .arg(QString::number(a.generatedFps, 'f', 1))
+                 .arg(submitFpsKnown() ? QString::number(submitFps(), 'f', 1) : tr("—"));
+    if (a.paceSamples > 8)
+        lines << tr("提交间隔 P50 %1 · P95 %2 · P99 %3 ms · 偏离 %4/%5")
+                     .arg(a.p50Ms, 0, 'f', 2).arg(a.p95Ms, 0, 'f', 2).arg(a.p99Ms, 0, 'f', 2)
+                     .arg(a.offCadence).arg(a.paceSamples);
+    lines << tr("丢槽 上限 %1 · 过近 %2 · GPU %3 · 重锚定 %4")
+                 .arg(a.droppedCap).arg(a.droppedNear).arg(a.droppedLoad).arg(a.resyncs);
+    if (a.fgGpuP95Ms > 0.05)
+        lines << tr("VFG %1 ms/帧 · 目标周期 %2 ms · 旁路 长间隔 %3 / 已达目标 %4")
+                     .arg(a.fgGpuP95Ms, 0, 'f', 2).arg(a.periodMs, 0, 'f', 1)
+                     .arg(a.bypassLong).arg(a.bypassAtTarget);
+    return lines.join(QLatin1Char('\n'));
+}
 QString QmlPlayerBridge::metricsSummary() const {
     const auto& s = impl_->snapshot;
     // Submit FPS, named as such: it is what we handed to the presenter, not what

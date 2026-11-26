@@ -71,6 +71,36 @@ struct PlayerOptions { bool nr=false,sr=false,fg=false,realtime=true; uint32_t f
         return o;}
 };
 enum class TransportState { Empty, Opening, Playing, Paused, Ended, Stopping, Failed };
+// AFG (engine/FixedTargetSchedule.h): what the running scheduler actually did,
+// refreshed once a second. Every rate here is measured - the target is carried
+// only so the UI can print "target 50, got 49.8" instead of implying it got 50.
+struct AfgStatus {
+    bool active=false;
+    double targetFps=0;
+    bool latencyCadence=false;
+    double periodMs=0;
+    // The engine's smoothed INPUT rate the scheduler planned against, and the rate
+    // of frames it actually inserted per second of picture. Neither is a display
+    // rate; they are the two numbers that must add up to the output.
+    double sourceFps=0;
+    // Generated frames per second of SOURCE time: frames inserted per second of
+    // picture, which is the number that must sit near targetFps - source rate.
+    double generatedFps=0;
+    // Delay the cadence policy added to the real frame, in ms (fixed cadence only).
+    double snapMs=0;
+    uint64_t generated=0,droppedCap=0,droppedNear=0,droppedLoad=0,resyncs=0;
+    uint64_t bypassLong=0,bypassAtTarget=0,bypassOff=0;
+    // Interval between our own successful presents (AfgOutputPace). This is the
+    // output cadence as delivered, not as planned.
+    unsigned paceSamples=0,offCadence=0;
+    double p50Ms=0,p95Ms=0,p99Ms=0,stddevMs=0;
+    // VFG's measured per-frame GPU cost (Fg1 P95) and the share of the output
+    // period it takes; >=1 means the GPU cannot fill the target.
+    double fgGpuP95Ms=0;
+    // Why the mode is not running, ASCII (EnhanceGraph/engine gate name), empty
+    // when it runs.
+    std::string blocked;
+};
 struct PlayerSnapshot {
     PresentationSettings presentation, presentationEffective;
     // XeSS/FSR owns Present; the UI greys the pacing controls when true.
@@ -94,6 +124,8 @@ struct PlayerSnapshot {
     EnhancementSettings desired,applied;bool applying=false;
     bool captureEnhancementLoading=false;
     bool nrActive=false,srActive=false,fgActive=false;
+    // AFG: the fixed-target scheduler's own measurements, empty while it is off.
+    AfgStatus afg;
     bool nrAutoActive=false;
     uint32_t nrAutoPercent=0,nrAutoWidth=0,nrAutoHeight=0;
     std::wstring nrAutoStatus;

@@ -273,6 +273,74 @@ int main() {
               "afg: a cap change does rebuild the graph");
     }
 
+    // GPU load adaptation: the cap only ever lowers a pair's count, and what it
+    // removes is reported separately from a configuration overflow.
+    {
+        // 100 FPS (10 ms period) needs three slots for a 33.3 ms pair, so a cap of
+        // one has something to remove. At 50 FPS the same pair asks for one and the
+        // cap could not tell "adapted" from "nothing to adapt".
+        const FixedTargetConfig cfg = config(100.0);
+        FixedTargetScheduler uncapped;
+        uncapped.configure(cfg);
+        const auto before = run(uncapped, std::vector<double>(30, 1000.0 / 30.0));
+        unsigned full = 0;
+        for (const auto& p : before) full += p.plan.count;
+        check(full > 0 && uncapped.stats().droppedLoad == 0,
+              "load: nothing is dropped while no cap is set");
+
+        FixedTargetScheduler s;
+        s.configure(cfg);
+        s.setLoadCap(1);
+        check(s.effectiveMaxRuns() == 1, "load: the cap lowers the per-pair ceiling");
+        const auto capped = run(s, std::vector<double>(30, 1000.0 / 30.0));
+        bool within = true;
+        unsigned limited = 0;
+        for (const auto& p : capped) within = within && p.plan.count <= 1;
+        for (const auto& p : capped) limited += p.plan.droppedLoad;
+        check(within, "load: no pair plans more frames than the measured GPU cost affords");
+        check(limited > 0 && s.stats().droppedLoad > 0, "load: removed slots are counted as droppedLoad");
+        check(s.stats().loadLimitedPairs > 0, "load: the pairs it acted on are counted");
+        // Off means off: the switch has to be honoured by the scheduler itself, not
+        // only by whoever sets the cap.
+        FixedTargetConfig manual = cfg;
+        manual.gpuLoadAdapt = false;
+        FixedTargetScheduler m;
+        m.configure(manual);
+        m.setLoadCap(1);
+        check(m.effectiveMaxRuns() == manual.maxRuns, "load: the adaptation switch overrides the cap");
+    }
+
+    // Buffer policy: the stall threshold and the per-pair ceiling are the two
+    // numbers it really changes.
+    {
+        check(fixedTargetStallMs(FixedTargetBufferPolicy::Tight) == 60.0, "buffer: tight gives up at 60 ms");
+        check(fixedTargetStallMs(FixedTargetBufferPolicy::Balanced) == 100.0, "buffer: balanced at 100 ms");
+        check(fixedTargetStallMs(FixedTargetBufferPolicy::Relaxed) == 250.0, "buffer: relaxed at 250 ms");
+        check(fixedTargetPolicyCap(FixedTargetBufferPolicy::Tight, 7) == 2, "buffer: tight caps a pair at two frames");
+        check(fixedTargetPolicyCap(FixedTargetBufferPolicy::Balanced, 7) == 7, "buffer: balanced keeps the rate cap");
+        // A 150 ms gap: over balanced's threshold, under relaxed's.
+        FixedTargetConfig balanced = config(50.0);
+        balanced.maxIntervalMs = fixedTargetStallMs(balanced.buffer);
+        FixedTargetScheduler b;
+        b.configure(balanced);
+        run(b, std::vector<double>(3, 1000.0 / 30.0));
+        const FixedTargetPlan longGap = b.plan(ms(2000), ms(2150), 30.0);
+        check(longGap.bypass && std::string(longGap.reason) == "longInterval",
+              "buffer: balanced bypasses a 150 ms gap");
+        FixedTargetConfig relaxed = config(50.0);
+        relaxed.buffer = FixedTargetBufferPolicy::Relaxed;
+        relaxed.maxIntervalMs = fixedTargetStallMs(relaxed.buffer);
+        FixedTargetScheduler r;
+        r.configure(relaxed);
+        run(r, std::vector<double>(3, 1000.0 / 30.0));
+        const FixedTargetPlan longGapRelaxed = r.plan(ms(2000), ms(2150), 30.0);
+        check(!longGapRelaxed.bypass && longGapRelaxed.count > 0,
+              "buffer: relaxed interpolates the same gap");
+        FixedTargetConfig bad = config(50.0);
+        bad.buffer = FixedTargetBufferPolicy(3);
+        check(!fixedTargetValid(bad), "buffer: an unknown policy is rejected");
+    }
+
     // Validation keeps hand-edited profiles out of the scheduler.
     {
         check(fixedTargetValid(FixedTargetConfig{}), "the disabled config is always valid");

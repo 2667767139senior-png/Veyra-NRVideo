@@ -55,6 +55,19 @@ enum class FixedTargetCadence : unsigned {
     Latency=1,
 };
 
+// How much a single input interval may hold back. See fixedTargetStallMs and
+// fixedTargetPolicyCap for the two numbers each one actually changes.
+enum class FixedTargetBufferPolicy : unsigned {
+    // Lowest latency: give up on a gap at 60 ms and never ask for more than two
+    // generated frames per pair.
+    Tight=0,
+    // Rate-derived cap (up to seven) and a 100 ms stall threshold. The default.
+    Balanced=1,
+    // Willing to interpolate across a 250 ms gap, which keeps the picture moving
+    // through a hitch but spends more GPU on the pair that recovers from it.
+    Relaxed=2,
+};
+
 struct FixedTargetConfig {
     bool enabled=false;
     // 50 FPS: the target this mode was written for (25-30 FPS content from a
@@ -67,6 +80,18 @@ struct FixedTargetConfig {
     // Generated frames per pair. Past this the extra slots are dropped rather
     // than generated: a GPU that cannot keep up must lose frames, not latency.
     unsigned maxRuns=2;
+    // How much one input interval may hold back (fixedTargetStallMs /
+    // fixedTargetPolicyCap). No policy lets slots accumulate: a growing queue is
+    // latency, and latency is the failure this mode exists to avoid.
+    FixedTargetBufferPolicy buffer=FixedTargetBufferPolicy::Balanced;
+    // Cap this pair's frame count by the measured VFG cost, so a GPU that cannot
+    // fill the target loses frames instead of falling behind. Only ever lowers
+    // the count the rate asked for.
+    bool gpuLoadAdapt=true;
+    // A pair whose explicit-timestep evaluation fails is retried once at the plain
+    // 2X position rather than failing the whole frame. Off = report the failure
+    // (the engine then takes its normal FG recovery path).
+    bool fallbackMultiplier=true;
 
     bool operator==(const FixedTargetConfig&)const=default;
 };
@@ -78,7 +103,17 @@ inline bool fixedTargetValid(const FixedTargetConfig& c){
     // read as a request to stop inserting rather than as an error.
     return std::isfinite(c.targetFps)&&c.targetFps>=0.0&&c.targetFps<=480.0&&
         std::isfinite(c.maxIntervalMs)&&c.maxIntervalMs>=20.0&&c.maxIntervalMs<=1000.0&&
-        c.maxRuns>=1&&c.maxRuns<=kFixedTargetMaxTicks;
+        c.maxRuns>=1&&c.maxRuns<=kFixedTargetMaxTicks&&
+        unsigned(c.buffer)<=2u;
+}
+
+// The gap that counts as a stall, per buffer policy.
+inline double fixedTargetStallMs(FixedTargetBufferPolicy p){
+    return p==FixedTargetBufferPolicy::Tight?60.0:p==FixedTargetBufferPolicy::Relaxed?250.0:100.0;
+}
+// The per-pair ceiling, applied on top of the rate-derived cap.
+inline unsigned fixedTargetPolicyCap(FixedTargetBufferPolicy p,unsigned rateCap){
+    return p==FixedTargetBufferPolicy::Tight?std::min(rateCap,2u):rateCap;
 }
 
 // Frames per pair a target rate needs at the slowest content this mode is meant
@@ -130,6 +165,8 @@ struct FixedTargetPlan {
     // Slots this pair wanted but did not get, for the log: past the per-pair cap,
     // or too close to an endpoint for a meaningful interpolation.
     unsigned droppedCap=0,droppedNear=0;
+    // The subset of droppedCap that the measured GPU cost removed (gpuLoadAdapt).
+    unsigned droppedLoad=0;
     bool operator==(const FixedTargetPlan&)const=default;
 };
 
@@ -139,6 +176,9 @@ public:
     struct Stats {
         uint64_t intervals=0,generated=0,droppedCap=0,droppedNear=0,resyncs=0;
         uint64_t bypassLong=0,bypassAtTarget=0,bypassInvalid=0,bypassOff=0;
+        // Slots removed because the measured VFG cost said the GPU could not take
+        // them. This is the number the load adaptation exists to make visible.
+        uint64_t droppedLoad=0,loadLimitedPairs=0;
         unsigned lastGenerated=0;
         double lastSpanMs=0,lastPeriodMs=20.0;
         // How far the real frame was pushed onto the grid. This IS the latency
@@ -155,6 +195,17 @@ public:
     }
     const FixedTargetConfig& config()const{return config_;}
     void reset(){const auto config=config_;*this=FixedTargetScheduler{};config_=config;}
+    // Measured load cap: the engine sets this from VFG's own per-frame GPU cost
+    // (the Fg1 stage P95) once a second. 0 disables the artificial cap, and the
+    // policy is off entirely when config().gpuLoadAdapt is false. It can only
+    // lower the count the rate asked for - a target the GPU can meet is never
+    // reduced by a measurement, only by a real cost that does not fit.
+    void setLoadCap(unsigned cap){loadCap_=cap;}
+    // The ceiling plan() applies to a pair, before its own capacity check.
+    unsigned effectiveMaxRuns()const{
+        if(!config_.gpuLoadAdapt||!loadCap_)return config_.maxRuns;
+        return std::min(loadCap_,config_.maxRuns);
+    }
 
     // a100ns/b100ns: the previous and current real frame timestamps.
     // measuredContentFps: the engine's smoothed input rate, used only to recognise
@@ -233,12 +284,20 @@ public:
             pts[found]=at;steps[found]=t;++found;
         }
         unsigned first=0;
-        if(found>config_.maxRuns){
+        const unsigned limit=effectiveMaxRuns();
+        if(found>limit){
             // Keep the newest slots: they are the ones still worth presenting, and
             // dropping the oldest leaves one hole instead of a growing backlog.
-            out.droppedCap+=found-config_.maxRuns;
-            stats_.droppedCap+=found-config_.maxRuns;
-            first=found-config_.maxRuns;found=config_.maxRuns;
+            const unsigned excess=found-limit;
+            if(limit<config_.maxRuns){
+                // The GPU said it cannot take them: this is the adaptation working,
+                // not a configuration error, so it gets its own counter.
+                out.droppedLoad+=excess;stats_.droppedLoad+=excess;++stats_.loadLimitedPairs;
+            }else{
+                out.droppedCap+=excess;
+                stats_.droppedCap+=excess;
+            }
+            first=found-limit;found=limit;
         }
         out.count=found;
         for(unsigned i=0;i<found;++i){out.pts100ns[i]=pts[first+i];out.timestep[i]=steps[first+i];}
@@ -265,6 +324,7 @@ private:
     bool anchored_=false;
     int64_t origin_=0;
     long long lastSlot_=0;
+    unsigned loadCap_=0;
 };
 
 // Measures what actually left the presenter, which is the only number that
