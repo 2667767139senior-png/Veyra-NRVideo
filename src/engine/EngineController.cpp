@@ -3528,7 +3528,14 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     // cost (Fg1 P95) rather than from a guess. The scheduler only
                     // ever lowers a pair's count with this, so a GPU that can meet
                     // the target is never affected.
-                    const auto fgP95=(frameFlow?frameFlow->snapshot(host100ns(),false).gpuTiming[size_t(diagnostics::GpuStage::Fg1)].p95:0.0);
+                    // The stage sample is optional: absent means "not measured yet",
+                    // which must leave the adaptation off rather than read as 0 ms.
+                    double fgP95=0.0;
+                    if(frameFlow){
+                        const auto flow=frameFlow->snapshot(host100ns(),false);
+                        const auto& sample=flow.gpuTiming[size_t(diagnostics::GpuStage::Fg1)].p95;
+                        if(sample)fgP95=*sample;
+                    }
                     const double targetFps=options.settings.fgFixedTarget.targetFps;
                     const double spanMs=st.lastSpanMs>0.0?st.lastSpanMs:(targetFps>0.5?1000.0/targetFps:33.3);
                     unsigned affordable=kFixedTargetMaxTicks;
