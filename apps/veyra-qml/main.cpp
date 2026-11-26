@@ -1052,6 +1052,28 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
                 else { bridge.setOutputRateMode(2); bridge.setOutputCustomFps(cap.toDouble()); }
                 veyra::log::info("qml-test", std::format("output cap: {}", cap.toStdString()));
             });
+        } else if (a == QLatin1String("--afg") && hasValue) {
+            // Test switch: the whole AFG setup through the same bridge entry points
+            // the panel uses (backend -> multiplier floor -> mode -> rate -> cadence
+            // -> buffer), applied once the source has opened. Nothing here is a
+            // private path: a failure means the panel would fail the same way.
+            // Format: --afg <fps> [fixed|latency] [tight|balanced|relaxed]
+            const int fps = args.at(++i).toInt();
+            QString cadence = QStringLiteral("fixed"), buffer = QStringLiteral("balanced");
+            if (i + 1 < args.size() && !args.at(i + 1).startsWith(QLatin1Char('-'))) cadence = args.at(++i);
+            if (i + 1 < args.size() && !args.at(i + 1).startsWith(QLatin1Char('-'))) buffer = args.at(++i);
+            QTimer::singleShot(1200, &bridge, [&bridge, fps, cadence, buffer] {
+                bridge.setFgBackendName(QStringLiteral("vfg"));
+                bridge.setFgMultiplier(2);
+                bridge.setFgMode(1);
+                bridge.setFgFixedTargetFps(fps);
+                bridge.setFgFixedTargetCadence(cadence == QLatin1String("latency") ? 1 : 0);
+                bridge.setFgFixedTargetBuffer(buffer == QLatin1String("tight") ? 0
+                                                 : buffer == QLatin1String("relaxed") ? 2 : 1);
+                veyra::log::info("qml-test", std::format("afg: fps={} cadence={} buffer={} backend={} mode={}",
+                                                         fps, cadence.toStdString(), buffer.toStdString(),
+                                                         bridge.fgBackendName().toStdString(), bridge.fgMode()));
+            });
         } else if (a == QLatin1String("--fg-auto")) {
             // Test switch: turn the automatic multiplier on (or off with `--fg-auto off`).
             // Same entry point the 自动选择倍率 switch uses, so the decision path is real.
