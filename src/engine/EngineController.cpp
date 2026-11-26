@@ -3094,7 +3094,15 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     const auto line=testReplayAsCard?testCardStart+int64_t((pkt.pts.toDouble()*1000-testCardFirstPtsMs)*10000*1.0008):pkt.arrivalHost100ns;
                     const auto until=line+int64_t(std::max(0.0,sum-3)*testArrivalJitterMs*10000);
                     while(host100ns()<until){advanceLive();std::this_thread::yield();}
-                    pkt.arrivalHost100ns=host100ns();
+                    // A capture card's callback is clocked by the device, not by
+                    // when this thread finished the previous frame. Using the wall
+                    // clock here made every replay frame late whenever processing
+                    // overran, and LiveArrivalSmoother snapped the clock on every
+                    // pair (measured: 8 snaps/s, callback-anchor alternating
+                    // 0.5/16.1 ms, a fake 42/20 cadence). Stamp the scheduled card
+                    // time instead: real overruns then show up as missed deadlines
+                    // and dropped slots instead of a distorted source clock.
+                    pkt.arrivalHost100ns=until;
                 }
                 const auto processStart=Clock::now();
                 const auto captureArrival=pkt.arrivalHost100ns?pkt.arrivalHost100ns:host100ns();
@@ -4184,15 +4192,11 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                         const double lateMs=isCapture&&timeline.paced()?
                                             double(presentBeginHost-timeline.deadline(item.pts100ns))/10000.0:
                                             (deviationValid?entryDeviation:0.0);
-                                        long long slot=0;double step=0.0;
-                                        if(fixedPlanPtr&&!fixedPlanPtr->bypass){
-                                            if(generated){
-                                                for(unsigned k=0;k<fixedPlanPtr->count;++k){
-                                                    const int64_t d=fixedPlanPtr->pts100ns[k]-item.pts100ns;
-                                                    if(d>-1000&&d<1000){slot=fixedPlanPtr->slotIndex[k];step=fixedPlanPtr->timestep[k];break;}
-                                                }
-                                            }else slot=fixedPlanPtr->realSlot;
-                                        }
+                                        // Read the identity carried by the frame itself.
+                                        // The current plan belongs to a newer pair and
+                                        // was what made every generated frame print slot 0.
+                                        const long long slot=item.gridSlot;
+                                        const double step=item.timestep;
                                         veyra::log::info("afg-frame",std::format("source={} kind={} subframe={} slot={} ptsMs={:.3f} timestep={:.4f} guardMs={:.3f} readyMs={:.3f} presentMs={:.3f} lateMs={:.3f} displayHz={:.3f} (slot = grid index, ptsMs = the slot it left on, readyMs = ready before Present in ms (-1000 = not observed), presentMs = since the first present, lateMs = Present against that slot)",
                                             item.identity.sourceFrameId,generated?"generated":"real",item.subframe,slot,
                                             double(item.pts100ns)/10000.0,step,double(fixedPlanPtr?fixedPlanPtr->guard100ns:0)/10000.0,

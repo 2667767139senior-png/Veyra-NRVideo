@@ -4779,6 +4779,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
                 ++metrics_.fgSubmittedCandidates;
                 BatchFrame f;f.identity=out.batch.identity;f.kind=FrameKind::Generated;f.validity=GenerationValidity::Pending;f.subframe=sub;
                 f.pts100ns=generatedPts;
+                if(fixedTarget&&sub<=fixedPlan->count){f.gridSlot=fixedPlan->slotIndex[sub-1];f.timestep=fixedPlan->timestep[sub-1];}
                 f.lease=std::make_shared<FrameLease>();f.lease->texture=genFrame_[generatedSlot];f.lease->slot=generatedSlot;
                 f.lease->readyFence=out.genFenceValue;f.lease->readyFenceObject=out.genFenceObject;generatedLeases_[generatedSlot]=f.lease;out.batch.append(std::move(f));
             }
@@ -4890,6 +4891,7 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     // timestamp (never earlier), so every frame leaves on the same grid. The plan
     // leaves this at 0 for the latency policy, which keeps the source timestamp.
     real.pts100ns=fixedTarget&&fixedPlan->realPts100ns>out.batch.b100ns?fixedPlan->realPts100ns:out.batch.b100ns;
+    if(fixedTarget){real.gridSlot=fixedPlan->realSlot;real.timestep=0.0;}
     real.lease=std::make_shared<FrameLease>();real.lease->texture=exclusionVideo_[parity]?exclusionVideo_[parity]:videoFrame_[parity];real.lease->sourceReference=sourceReferences_[parity];real.lease->baseReference=baseReferences_[parity];real.lease->slot=parity;real.lease->readyFence=out.videoFenceValue;real.lease->readyFenceObject=out.videoFenceObject;real.lease->referencesValid=retainReferences;realLeases_[parity]=real.lease;out.batch.append(std::move(real));
     if(veyra::log::verboseFrameLogs())veyra::log::info("frame-batch",std::format("batch={} epoch={} revision={} source={} a={} b={} count={} realSlot={} realFence={} genSlot={} genFence={}",out.batch.batchId,epoch_,out.batch.identity.settingsRevision,out.batch.identity.sourceFrameId,out.batch.a100ns,out.batch.b100ns,out.batch.count,parity,out.videoFenceValue,out.genSlot,out.genFenceValue));
     if(pausedEligible&&lastAppliedSettings_){

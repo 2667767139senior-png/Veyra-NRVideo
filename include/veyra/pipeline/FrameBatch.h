@@ -36,6 +36,12 @@ struct BatchFrame {
     GenerationValidity validity=GenerationValidity::NotApplicable;
     uint32_t subframe=0;
     int64_t pts100ns=0;
+    // Grid identity, assigned when the frame is created. The present step runs
+    // later than the pair that produced the frame, so looking the slot up in the
+    // then-current plan cannot identify it (and used to report slot 0 for every
+    // generated frame). A re-anchor changes absolute times, but never a slot ID.
+    int64_t gridSlot=-1;
+    double timestep=0;
     std::shared_ptr<FrameLease> lease;
 };
 struct FrameBatch {
