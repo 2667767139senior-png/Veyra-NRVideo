@@ -3416,7 +3416,13 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         const auto lastGenerated=fixedPlanPtr?
                             (fixedPlanPtr->count?fixedPlanPtr->pts100ns[fixedPlanPtr->count-1]:
                              (fixedPlanPtr->realPts100ns>0?fixedPlanPtr->realPts100ns:batch.b100ns)):
-                            pipeline::FrameBatch::interpolate(a,batch.b100ns,previewFgMultiplier-1,previewFgMultiplier);
+                            // The first pair can arrive before the capture clock
+                            // has an interval, making a == b. interpolate() then
+                            // throws and killed the whole legacy run ("invalid
+                            // interpolation interval" at the first Present).
+                            (a<batch.b100ns&&previewFgMultiplier>1?
+                             pipeline::FrameBatch::interpolate(a,batch.b100ns,previewFgMultiplier-1,previewFgMultiplier):
+                             batch.b100ns);
                         const auto now=host100ns();
                         const double elapsed=elapsedMs(processStart);
                         const auto earliest=now+fgBudget.requiredDeadlineLead(now,elapsed,presentP95,warmingHistory);

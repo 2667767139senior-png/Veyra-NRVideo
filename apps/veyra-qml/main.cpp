@@ -1125,7 +1125,10 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
             // own setters. The AFG regression suite runs this before and after the
             // new mode to show the old behaviour is bit-for-bit what it was.
             const int multiplier = args.at(++i).toInt();
-            QTimer::singleShot(1200, &bridge, [&bridge, multiplier] {
+            // Apply before the 600 ms startup open: switching from a persisted
+            // AFG setting to legacy after the source started rebuilt the graph
+            // mid-play and killed the regression run.
+            QTimer::singleShot(300, &bridge, [&bridge, multiplier] {
                 bridge.setFgBackendName(QStringLiteral("vfg"));
                 bridge.setFgMode(0);
                 bridge.setFgMultiplier(multiplier);
