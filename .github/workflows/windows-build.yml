@@ -166,6 +166,16 @@ jobs:
           & C:\b\veyra_fixed_target_schedule_tests.exe
           if ($LASTEXITCODE -ne 0) { throw "veyra_fixed_target_schedule_tests failed with $LASTEXITCODE" }
 
+      # The multiplier <-> AFG switching regression lives here: requiresGraphRebuild()
+      # decides whether the VFG generated pool is resized, which the arithmetic-only
+      # schedule test cannot cover. Gate the build on it so a future edit cannot
+      # silently reintroduce the rejected-settings bug.
+      - name: Run effect-chain graph-rebuild tests
+        run: |
+          cmake --build C:\b --target veyra_effect_chain_tests
+          & C:\b\veyra_effect_chain_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "veyra_effect_chain_tests failed with $LASTEXITCODE" }
+
       # Built here, run on a machine that actually has the runtime: CI has no GPU,
       # and whether VFG's timestep mode places a frame where it was asked to is
       # what the AFG scheduler rests on.
