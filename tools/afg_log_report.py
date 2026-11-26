@@ -69,6 +69,7 @@ class Run:
     frames: list[int] = field(default_factory=list)
     reason: dict[str, int] = field(default_factory=dict)
     snap_ms: list[float] = field(default_factory=list)
+    guard_ms: list[float] = field(default_factory=list)
     fg_gpu: list[float] = field(default_factory=list)
     load_cap: list[int] = field(default_factory=list)
     counters: dict[str, int] = field(default_factory=dict)
@@ -114,6 +115,8 @@ def parse(path: Path) -> Run:
         run.frames.append(int(num(v, "frames")))
         run.reason[v.get("reason", "?")] = run.reason.get(v.get("reason", "?"), 0) + 1
         run.snap_ms.append(num(v, "snapMs"))
+        if "guardMs" in v:
+            run.guard_ms.append(num(v, "guardMs"))
         if "fgGpuP95Ms" in v:
             run.fg_gpu.append(num(v, "fgGpuP95Ms"))
         if "loadCap" in v:
@@ -137,14 +140,23 @@ def pct(values: list[float], q: float) -> float:
 def report(run: Run, period: float) -> tuple[dict, list[str]]:
     problems: list[str] = []
     samples = sum(w.samples for w in run.windows)
-    off = sum(w.off for w in run.windows)
+    # Builds before 2026-11-26 counted off-cadence intervals cumulatively while the
+    # percentiles came from a sliding window, so the raw figure reads "1211 of 256".
+    # Recovering the per-window increments keeps old logs measurable.
+    offs = [w.off for w in run.windows]
+    cumulative_off = all(b >= a for a, b in zip(offs, offs[1:])) and (not offs or offs[-1] > (offs[0] if offs else 0))
+    off = (sum(b - a for a, b in zip([0] + offs, offs)) if cumulative_off
+           else sum(offs))
+    # The first windows carry start-up (first frame, graph warm-up). The cadence
+    # judgement is about steady play, and the start-up spike is reported separately.
+    steady = run.windows[2:] or run.windows
 
     # Weighted by samples, so a run with a slow start is not over-counted.
     mean_interval = (sum(w.mean * w.samples for w in run.windows) / samples) if samples else 0.0
-    worst_p95 = max((w.p95 for w in run.windows), default=0.0)
-    worst_p99 = max((w.p99 for w in run.windows), default=0.0)
-    typical_p95 = pct([w.p95 for w in run.windows], 0.5)
-    typical_p50 = pct([w.p50 for w in run.windows], 0.5)
+    worst_p95 = max((w.p95 for w in steady), default=0.0)
+    worst_p99 = max((w.p99 for w in steady), default=0.0)
+    typical_p95 = pct([w.p95 for w in steady], 0.5)
+    typical_p50 = pct([w.p50 for w in steady], 0.5)
 
     summary = {
         "seconds": len(run.frames),
@@ -162,6 +174,7 @@ def report(run: Run, period: float) -> tuple[dict, list[str]]:
             "worst_window_p99_ms": round(worst_p99, 3),
             "off_cadence": off,
             "off_cadence_ratio": round(off / samples, 4) if samples else 0.0,
+            "off_cadence_cumulative": cumulative_off,
         },
         "source": {
             "p50_fps": round(pct(run.source_fps, 0.5), 2),
@@ -186,6 +199,8 @@ def report(run: Run, period: float) -> tuple[dict, list[str]]:
             "p95": round(pct(run.snap_ms, 0.95), 2),
             "max": round(max(run.snap_ms), 2) if run.snap_ms else 0.0,
         },
+        "guard_ms": {"p50": round(pct(run.guard_ms, 0.5), 2),
+                     "max": round(max(run.guard_ms), 2) if run.guard_ms else 0.0},
         "vfg_gpu_ms": {
             "p50": round(pct(run.fg_gpu, 0.5), 2),
             "p95": round(pct(run.fg_gpu, 0.95), 2),
@@ -246,7 +261,7 @@ def main() -> int:
               f"worst window P95 {p['worst_window_p95_ms']:.2f} P99 {p['worst_window_p99_ms']:.2f} ms")
         print(f"  cadence    {p['off_cadence']}/{p['samples']} off ({p['off_cadence_ratio']:.2%})")
         print(f"  frames/pair {summary['frames_per_pair']}  reasons {summary['reason']}")
-        print(f"  snap ms    {summary['snap_ms']}  vfg gpu {summary['vfg_gpu_ms']}")
+        print(f"  snap ms    {summary['snap_ms']}  guard {summary['guard_ms']} ms  vfg gpu {summary['vfg_gpu_ms']}")
         print(f"  counters   {summary['counters']}")
         if summary["load_cap"]:
             print(f"  load cap   {summary['load_cap']}")

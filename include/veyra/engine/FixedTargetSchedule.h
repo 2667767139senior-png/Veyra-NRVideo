@@ -263,8 +263,10 @@ public:
             // Lookahead, in whole periods: one input interval is what it takes for
             // the second half of a pair to exist. Clamped to 1..3 periods so a
             // pathological first interval cannot stall the output.
-            const double slots=std::ceil(spanMs/(period/10000.0)-1e-9);
-            guardTicks_=static_cast<int64_t>(std::llround(std::clamp(slots,1.0,3.0)*period));
+            // (Named slotSpan, not "slots": Qt defines that as an empty macro, and
+            // this header is included from Qt translation units.)
+            const double slotSpan=std::ceil(spanMs/(period/10000.0)-1e-9);
+            guardTicks_=static_cast<int64_t>(std::llround(std::clamp(slotSpan,1.0,3.0)*period));
         }
         // The latency policy keeps the source clock, so it takes no lookahead (its
         // output is the union of two clocks by design).
