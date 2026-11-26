@@ -98,13 +98,18 @@ int main() {
         bool exact = true, monotonic = true, snapBounded = true, steps = true;
         int64_t previous = std::numeric_limits<int64_t>::min();
         for (const auto& p : pairs) {
-            if (p.plan.realPts100ns < p.b || p.plan.realPts100ns - p.b >= period) snapBounded = false;
+            // The guard is a constant lookahead on every frame, so the snap is what
+            // is left after removing it.
+            const int64_t snapped = p.plan.realPts100ns - p.plan.guard100ns;
+            if (snapped < p.b || snapped - p.b >= period) snapBounded = false;
             for (unsigned k = 0; k < p.plan.count; ++k) {
                 const int64_t slot = p.plan.pts100ns[k];
                 if ((slot - pairs.front().a) % period != 0) exact = false;
                 if (slot <= previous) monotonic = false;
                 previous = slot;
-                const double expected = double(slot - p.a) / double(p.b - p.a);
+                // The guard shifts the presentation time only; the position inside
+                // the pair is still measured from the slot itself.
+                const double expected = double(slot - p.plan.guard100ns - p.a) / double(p.b - p.a);
                 if (!(p.plan.timestep[k] > 0.0 && p.plan.timestep[k] < 1.0)) steps = false;
                 if (std::abs(p.plan.timestep[k] - expected) > 1e-9) steps = false;
             }
@@ -136,7 +141,7 @@ int main() {
         for (const auto& p : pairs) {
             every = every && p.plan.count == 1;
             half = half && std::abs(p.plan.timestep[0] - 0.5) < 1e-9;
-            onGrid = onGrid && p.plan.realPts100ns == p.b;
+            onGrid = onGrid && p.plan.realPts100ns - p.plan.guard100ns == p.b;
         }
         check(every, "25->50: one generated frame per 40 ms pair");
         check(half, "25->50: it sits at t = 0.5");
@@ -173,7 +178,7 @@ int main() {
         check(pairs[3].plan.bypass && std::string(pairs[3].plan.reason) == "longInterval",
               "stall: the long pair is bypassed, not interpolated");
         check(pairs[4].plan.count <= 2, "stall: the next pair is not charged for the gap");
-        check(pairs[4].plan.realPts100ns - pairs[4].b < ms(20.0),
+        check(pairs[4].plan.realPts100ns - pairs[4].plan.guard100ns - pairs[4].b < ms(20.0),
               "stall: the grid restarts in phase, no accumulated offset");
     }
 
@@ -241,7 +246,7 @@ int main() {
         for (const auto& p : pairs) {
             for (unsigned k = 0; k < p.plan.count; ++k)
                 if ((p.plan.pts100ns[k] - pairs.front().a) % period != 0) exact = false;
-            if ((p.plan.realPts100ns - pairs.front().a) % period != 0) bounded = false;
+            if ((p.plan.realPts100ns - p.plan.guard100ns - pairs.front().a) % period != 0) bounded = false;
         }
         check(exact, "5 min at 29.97 -> 50: generated slots never drift off the grid");
         check(bounded, "5 min at 29.97 -> 50: real frames stay on the grid too");
@@ -271,6 +276,36 @@ int main() {
               "afg: a rate change keeps the same graph structure");
         check(!fixedTargetSameStructure(config(50.0, 2), config(50.0, 4)),
               "afg: a cap change does rebuild the graph");
+    }
+
+    // Lookahead (FixedTargetPlan::guard100ns). A generated frame between A and B
+    // only exists once B does, so a grid with no lookahead gets presented late and
+    // the spacing turns into 27/13 ms around a correct 20 ms mean - measured on a
+    // real 30 -> 50 run before this was added. The guard is a whole number of
+    // periods and the same for every frame, so spacing is untouched.
+    {
+        FixedTargetScheduler s;
+        s.configure(config(50.0));
+        const auto pairs = run(s, std::vector<double>(30, 1000.0 / 30.0));
+        const auto guard = pairs[1].plan.guard100ns;
+        check(guard >= ms(20.0) && guard % ms(20.0) == 0,
+              "guard: a whole number of periods, at least one");
+        check(guard == ms(40.0), "guard: 33.3 ms of input needs two 20 ms periods");
+        bool constant = true;
+        for (const auto& p : pairs) constant = constant && p.plan.guard100ns == guard;
+        check(constant, "guard: constant across the run, so it cannot modulate the cadence");
+        // 25 FPS: 40 ms is exactly two periods, so the guard is exactly one interval.
+        FixedTargetScheduler q;
+        q.configure(config(50.0));
+        const auto slow = run(q, std::vector<double>(20, 40.0), ms(1000), 25.0);
+        check(slow[1].plan.guard100ns == ms(40.0), "guard: 40 ms of input needs two periods too");
+        // Latency policy takes no lookahead: it keeps the source clock on purpose.
+        FixedTargetScheduler l;
+        l.configure(config(50.0, 0, FixedTargetCadence::Latency));
+        const auto fast = run(l, std::vector<double>(20, 1000.0 / 30.0));
+        bool noGuard = true;
+        for (const auto& p : fast) noGuard = noGuard && p.plan.guard100ns == 0;
+        check(noGuard, "guard: the latency policy adds none");
     }
 
     // GPU load adaptation: the cap only ever lowers a pair's count, and what it

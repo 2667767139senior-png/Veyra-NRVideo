@@ -158,8 +158,22 @@ struct FixedTargetPlan {
     // VFG Timestep for the same frame: (pts - a) / (b - a), strictly inside (0,1).
     std::array<double,Capacity> timestep{};
     // Presentation time to use for the real frame (0 = keep its own timestamp).
-    // Slots are snapped up, so this is at or after b.
+    // Slots are snapped up, so this is at or after b, plus the guard below.
     int64_t realPts100ns=0;
+    // Presentation lookahead added to EVERY frame of this run, in 100 ns.
+    //
+    // A generated frame between A and B cannot exist before B arrives, so a slot
+    // at a+period is due in media time roughly one input interval before its own
+    // inputs do. Without this shift the presenter shows it as soon as it is ready
+    // and the output alternates late/early around a correct mean - measured
+    // 2026-11-26 on a 30 -> 50 run (RTX 3080 Laptop, 1440p): P50 19.9 ms but
+    // P95 27.1 ms, i.e. 27/13 alternation, which is exactly the judder this mode
+    // exists to remove. Shifting the whole output by the same number of periods
+    // restores the spacing and costs exactly that delay.
+    //
+    // Whole periods, so the output stays on the slot lattice. Applied only to the
+    // fixed cadence: the latency policy deliberately keeps the source clock.
+    int64_t guard100ns=0;
     bool bypass=false;
     const char* reason="off";
     // Slots this pair wanted but did not get, for the log: past the per-pair cap,
@@ -184,6 +198,8 @@ public:
         // How far the real frame was pushed onto the grid. This IS the latency
         // the cadence policy adds, in milliseconds.
         double lastSnapMs=0;
+        // The lookahead the fixed cadence adds to every frame (whole periods).
+        double lastGuardMs=0;
         int64_t lastSlotIndex=0;
     };
 
@@ -244,7 +260,16 @@ public:
             // The first real frame of a run owns slot 0: the output clock starts
             // where the picture does, so no slot is ever in the past.
             origin_=a100ns;lastSlot_=0;anchored_=true;++stats_.resyncs;
+            // Lookahead, in whole periods: one input interval is what it takes for
+            // the second half of a pair to exist. Clamped to 1..3 periods so a
+            // pathological first interval cannot stall the output.
+            const double slots=std::ceil(spanMs/(period/10000.0)-1e-9);
+            guardTicks_=static_cast<int64_t>(std::llround(std::clamp(slots,1.0,3.0)*period));
         }
+        // The latency policy keeps the source clock, so it takes no lookahead (its
+        // output is the union of two clocks by design).
+        const int64_t guard=config_.cadence==FixedTargetCadence::Fixed?guardTicks_:0;
+        out.guard100ns=guard;
         const auto slotTime=[&](long long index){
             return origin_+static_cast<int64_t>(std::llround(double(index)*period));
         };
@@ -300,12 +325,13 @@ public:
             first=found-limit;found=limit;
         }
         out.count=found;
-        for(unsigned i=0;i<found;++i){out.pts100ns[i]=pts[first+i];out.timestep[i]=steps[first+i];}
+        for(unsigned i=0;i<found;++i){out.pts100ns[i]=pts[first+i]+guard;out.timestep[i]=steps[first+i];}
         out.outputMultiplier=found+1u;
         if(config_.cadence==FixedTargetCadence::Fixed){
-            out.realPts100ns=slotTime(slotB);
-            stats_.lastSnapMs=double(out.realPts100ns-b100ns)/10000.0;
+            out.realPts100ns=slotTime(slotB)+guard;
+            stats_.lastSnapMs=double(out.realPts100ns-guard-b100ns)/10000.0;
         }else stats_.lastSnapMs=0.0;
+        stats_.lastGuardMs=double(guard)/10000.0;
         lastSlot_=slotB;
         out.reason=found?"grid":"none";
         stats_.lastGenerated=found;
@@ -324,6 +350,8 @@ private:
     bool anchored_=false;
     int64_t origin_=0;
     long long lastSlot_=0;
+    // Lookahead in 100 ns, set when the grid anchors (see FixedTargetPlan::guard100ns).
+    int64_t guardTicks_=0;
     unsigned loadCap_=0;
 };
 
@@ -334,21 +362,28 @@ private:
 class AfgOutputPace {
 public:
     static constexpr unsigned Capacity=256;
+    // 2 ms buckets up to 30 ms, then everything longer. The shape is what tells
+    // "uniform" apart from "correct mean": a 27/13 alternation has a perfect mean
+    // and two peaks, and no percentile alone makes that obvious.
+    static constexpr unsigned Buckets=16;
     struct Summary {
         unsigned samples=0;
         double p50=0,p95=0,p99=0,mean=0,stddev=0;
         // Intervals that were not one period: a late frame, a dropped slot or a
-        // stall. Counted against the target period, with a 10% tolerance.
+        // stall. Counted against the target period, with a 10% tolerance, inside
+        // the same window the percentiles come from.
         unsigned offCadence=0;
+        std::array<unsigned,Buckets> histogram{};
+        double bucketMs=2.0;
     };
-    void reset(){count_=0;head_=0;last_=0;offCadence_=0;}
+    void reset(){count_=0;head_=0;last_=0;}
     void record(int64_t now,double periodMs){
         if(last_>0&&now>last_){
             const double interval=double(now-last_)/10000.0;
             if(interval>0.0&&interval<1000.0){
-                if(count_<Capacity)samples_[(head_+count_)%Capacity]=interval,++count_;
-                else{samples_[head_]=interval;head_=(head_+1)%Capacity;}
-                if(periodMs>0.0&&std::abs(interval-periodMs)>periodMs*0.1)++offCadence_;
+                const bool off=periodMs>0.0&&std::abs(interval-periodMs)>periodMs*0.1;
+                if(count_<Capacity){samples_[(head_+count_)%Capacity]=interval;off_[((head_+count_)%Capacity)]=off?1:0;++count_;}
+                else{samples_[head_]=interval;off_[head_]=off?1:0;head_=(head_+1)%Capacity;}
             }
         }
         last_=now;
@@ -356,11 +391,16 @@ public:
     Summary summary()const{
         Summary out;
         out.samples=count_;
-        out.offCadence=offCadence_;
         if(!count_)return out;
         std::array<double,Capacity> sorted{};
         double sum=0;
-        for(unsigned i=0;i<count_;++i){const double v=samples_[(head_+i)%Capacity];sorted[i]=v;sum+=v;}
+        for(unsigned i=0;i<count_;++i){
+            const double v=samples_[(head_+i)%Capacity];
+            sorted[i]=v;sum+=v;
+            out.offCadence+=off_[(head_+i)%Capacity]?1u:0u;
+            const double bucket=v/out.bucketMs;
+            ++out.histogram[bucket>=double(Buckets-1)?Buckets-1:unsigned(bucket)];
+        }
         std::sort(sorted.begin(),sorted.begin()+count_);
         const auto at=[&](double q){return sorted[std::min(count_-1,unsigned(q*double(count_-1)+0.5))];};
         out.p50=at(0.50);out.p95=at(0.95);out.p99=at(0.99);
@@ -372,7 +412,8 @@ public:
     }
 private:
     std::array<double,Capacity> samples_{};
-    unsigned count_=0,head_=0,offCadence_=0;
+    std::array<uint8_t,Capacity> off_{};
+    unsigned count_=0,head_=0;
     int64_t last_=0;
 };
 }

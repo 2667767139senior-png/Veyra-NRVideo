@@ -2065,7 +2065,7 @@ VPage {
                                 label: qsTr("输出节奏")
                                 visible: veyra.fgFixedTarget
                                 hint: veyra.fgFixedTargetCadence === 0
-                                      ? qsTr("固定网格：真实帧取「不早于自己时间戳」的第一个输出槽位，全部输出间隔恒定是 1000/目标帧率，代价是最多一个槽位的延迟")
+                                      ? qsTr("固定网格：真实帧取「不早于自己时间戳」的第一个输出槽位，全部输出间隔恒定是 1000/目标帧率。代价是延迟：对齐最多一个槽位，另加固定前瞻（生成帧要等第二个真实帧才能存在；30→50 实测需要 2 个周期 = 40 ms）。实测数据见日志 fixed-target 的 guardMs")
                                       : qsTr("低延迟：真实帧保持原时间戳，只填空隙。不增加延迟，但输出是网格与源时钟的并集，间隔不完全均匀")
                                 VSeg {
                                     objectName: "list-fg-fixed-target-cadence-seg"

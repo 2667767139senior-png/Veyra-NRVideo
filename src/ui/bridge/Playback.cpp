@@ -145,7 +145,8 @@ QString QmlPlayerBridge::afgStatusText() const {
     lines << tr("目标 %1 FPS · 输出节奏 %2%3")
                  .arg(a.targetFps, 0, 'f', 0)
                  .arg(a.latencyCadence ? tr("低延迟") : tr("固定网格"))
-                 .arg(a.latencyCadence ? QString() : tr("（真实帧最多晚 %1 ms）").arg(a.snapMs, 0, 'f', 1));
+                 .arg(a.latencyCadence ? QString()
+                                       : tr("（真实帧最多晚 %1 ms，另加前瞻 %2 ms）").arg(a.snapMs, 0, 'f', 1).arg(a.guardMs, 0, 'f', 1));
     // Source, generated and submit are three different measurements; the target
     // rate is never shown in their place.
     lines << tr("源（实测）%1 · 生成 %2 · 提交 %3 FPS")
@@ -156,6 +157,8 @@ QString QmlPlayerBridge::afgStatusText() const {
         lines << tr("提交间隔 P50 %1 · P95 %2 · P99 %3 ms · 偏离 %4/%5")
                      .arg(a.p50Ms, 0, 'f', 2).arg(a.p95Ms, 0, 'f', 2).arg(a.p99Ms, 0, 'f', 2)
                      .arg(a.offCadence).arg(a.paceSamples);
+    if (!a.latencyCadence && a.guardMs > 0.0)
+        lines << tr("前瞻 %1 ms（%2 个输出周期）：生成帧要等第二个真实帧才能存在，这段延迟买的是均匀间隔").arg(a.guardMs, 0, 'f', 1).arg(a.periodMs > 0.0 ? int(a.guardMs / a.periodMs + 0.5) : 0);
     lines << tr("丢槽 上限 %1 · 过近 %2 · GPU %3 · 重锚定 %4")
                  .arg(a.droppedCap).arg(a.droppedNear).arg(a.droppedLoad).arg(a.resyncs);
     if (a.fgGpuP95Ms > 0.05)

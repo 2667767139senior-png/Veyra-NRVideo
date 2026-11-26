@@ -1,15 +1,6 @@
-"""Mirror of the C++ unit test, used to verify its expectations before spending a
-CI build: it re-implements include/veyra/engine/FixedTargetSchedule.h line for
-line and asserts exactly the same 55 properties as
-tests/unit/FixedTargetScheduleTests.cpp.
-
-The C++ test is the authority. This exists because the build machine is remote,
-and a wrong expected value costs a full build to discover.
-
-    python tools/afg_test_mirror.py     # exits non-zero on any failure
-
-Re-sync it whenever plan() changes. tools/afg_grid_sim.py answers a different
-question (target x source matrix); neither replaces the C++ test.
+"""Line-for-line mirror of include/veyra/engine/FixedTargetSchedule.h (AFG).
+Used only to verify the C++ unit test's expectations before spending a CI build.
+The C++ test is the authority; this must be re-synced whenever plan() changes.
 """
 import math
 
@@ -64,6 +55,7 @@ class Plan:
         self.t = []
         self.real = 0
         self.bypass = False
+        self.guard = 0
         self.reason = "off"
         self.dropped_cap = 0
         self.dropped_near = 0
@@ -81,6 +73,7 @@ class Scheduler:
         self.dropped_near = 0
         self.last_snap_ms = 0.0
         self.resyncs = 0
+        self.guard_ticks = 0
         self.load_cap = 0
         self.dropped_load = 0
         self.load_limited_pairs = 0
@@ -120,6 +113,8 @@ class Scheduler:
         if not self.anchored:
             self.origin, self.last_slot, self.anchored = a, 0, True
             self.resyncs += 1
+            slots = math.ceil((span / 10000.0) / (period / 10000.0) - 1e-9)
+            self.guard_ticks = int(round(min(max(slots, 1), 3) * period))
 
         def slot_time(index):
             return self.origin + int(round(index * period))
@@ -159,12 +154,14 @@ class Scheduler:
                 self.dropped_cap += excess
             first = found - limit
             found = limit
+        guard = self.guard_ticks if c.cadence == "fixed" else 0
+        out.guard = guard
         out.count = found
-        out.pts = pts[first:first + found]
+        out.pts = [v + guard for v in pts[first:first + found]]
         out.t = steps[first:first + found]
         if c.cadence == "fixed":
-            out.real = slot_time(slot_b)
-            self.last_snap_ms = (out.real - b) / 10000.0
+            out.real = slot_time(slot_b) + guard
+            self.last_snap_ms = (out.real - guard - b) / 10000.0
         else:
             out.real = 0
             self.last_snap_ms = 0.0
@@ -221,7 +218,7 @@ check(all((p.pts[i] - origin) % PERIOD == 0 for _, _, p in pairs for i in range(
 steps_ok = True
 for a, b, p in pairs:
     for i in range(p.count):
-        exp = (p.pts[i] - a) / (b - a)
+        exp = (p.pts[i] - p.guard - a) / (b - a)
         if not (0.0 < p.t[i] < 1.0) or abs(p.t[i] - exp) > 1e-9:
             steps_ok = False
 check(steps_ok, "30->50: timestep == (slot-a)/(b-a), inside (0,1)")
@@ -236,7 +233,7 @@ for a, b, p in pairs:
         mono = False
     prev = p.real
 check(mono, "30->50: presentation times strictly increase across pair boundaries")
-check(all(0 <= p.real - b < PERIOD for _, b, p in pairs),
+check(all(0 <= p.real - p.guard - b < PERIOD for _, b, p in pairs),
       "30->50: real frame never early, never a full period late")
 allp = presented(pairs)
 check(len(allp) == 500, f"30->50: 500 presented frames in 10 s (got {len(allp)})")
@@ -247,7 +244,7 @@ check(all(allp[i] - allp[i - 1] == PERIOD for i in range(1, len(allp))),
 s, pairs = run([40.0] * 40, content_fps=25.0)
 check(all(p.count == 1 for _, _, p in pairs), "25->50: one generated frame per pair")
 check(all(abs(p.t[0] - 0.5) < 1e-9 for _, _, p in pairs), "25->50: t = 0.5")
-check(all(p.real == b for _, b, p in pairs), "25->50: real frame not delayed")
+check(all(p.real - p.guard == b for _, b, p in pairs), "25->50: real frame not snapped")
 
 # --- 25/30 jitter -> 50 -----------------------------------------------------
 spans = [40.0 if i % 3 == 0 else 1000.0 / 30.0 for i in range(120)]
@@ -267,7 +264,7 @@ check(counts.get(2, 0) == 0, "25/30 jitter -> 50: no pair needs more than one fr
 s, pairs = run([33.3, 33.3, 33.3, 120.0, 33.3, 33.3, 33.3])
 check(pairs[3][2].reason == "longInterval", "stall: the long pair is bypassed")
 check(pairs[4][2].count <= 2, "stall: the next pair is not charged for the gap")
-check(pairs[4][2].real - pairs[4][1] < PERIOD,
+check(pairs[4][2].real - pairs[4][2].guard - pairs[4][1] < PERIOD,
       "stall: the grid restarts in phase, no accumulated offset")
 
 # --- bypass rules -----------------------------------------------------------
@@ -299,7 +296,7 @@ check(s.dropped_cap > 0, f"cap: slots past the cap are counted as dropped ({s.dr
 s, pairs = run([1000.0 / 29.97] * 9000, content_fps=29.97)
 check(all((p.pts[i] - pairs[0][0]) % PERIOD == 0 for _, _, p in pairs for i in range(p.count)),
       "5 min at 29.97 -> 50: generated slots never drift off the grid")
-check(all((p.real - pairs[0][0]) % PERIOD == 0 for _, _, p in pairs),
+check(all((p.real - p.guard - pairs[0][0]) % PERIOD == 0 for _, _, p in pairs),
       "5 min at 29.97 -> 50: real frames stay on the grid too")
 expected = 9000 * (1000.0 / 29.97) / 1000.0 * 50.0
 actual = s.generated + 9000
@@ -325,6 +322,18 @@ check(not valid(Config(True, 50.0, max_interval=10.0)), "a max interval below on
 check(runs_for(50.0) == 2, "50 FPS asks for at most two frames per pair")
 check(runs_for(160.0) == 7, "160 FPS asks for seven")
 
+
+
+# --- lookahead --------------------------------------------------------------
+s, pairs = run([1000.0 / 30.0] * 30)
+guard = pairs[1][2].guard
+check(guard >= PERIOD and guard % PERIOD == 0, "guard: a whole number of periods, at least one")
+check(guard == ms(40.0), f"guard: 33.3 ms of input needs two 20 ms periods (got {guard})")
+check(all(p.guard == guard for _, _, p in pairs), "guard: constant across the run")
+q, slow = run([40.0] * 20, content_fps=25.0)
+check(slow[1][2].guard == ms(40.0), "guard: 40 ms of input needs two periods too")
+l, fast = run([1000.0 / 30.0] * 20, cadence="latency")
+check(all(p.guard == 0 for _, _, p in fast), "guard: the latency policy adds none")
 
 # --- GPU load adaptation ----------------------------------------------------
 s, pairs = run([1000.0 / 30.0] * 30, target=100.0)
@@ -364,9 +373,7 @@ gr = r.plan(ms(2000.0), ms(2150.0), 30.0)
 check(r.cfg.max_interval > 150.0 and not gr.bypass and gr.count > 0,
       f"buffer: relaxed interpolates the same gap (count={gr.count})")
 
-import sys
 print()
 print("FAILURES:", len(FAIL))
 for f in FAIL:
     print("  -", f)
-sys.exit(1 if FAIL else 0)

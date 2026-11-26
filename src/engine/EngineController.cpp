@@ -3561,7 +3561,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         afg.periodMs=targetFps>0.5?1000.0/targetFps:0.0;
                         afg.sourceFps=pairContentFps;
                         afg.generatedFps=afgRateFps;
-                        afg.snapMs=st.lastSnapMs;
+                        afg.snapMs=st.lastSnapMs;afg.guardMs=st.lastGuardMs;
                         afg.generated=st.generated;afg.droppedCap=st.droppedCap;afg.droppedNear=st.droppedNear;
                         afg.droppedLoad=st.droppedLoad;afg.resyncs=st.resyncs;
                         afg.bypassLong=st.bypassLong;afg.bypassAtTarget=st.bypassAtTarget;afg.bypassOff=st.bypassOff;
@@ -3577,14 +3577,14 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     for(unsigned i=0;i<fixedPlanPtr->count&&i<4;++i)
                         slots+=std::format("{}{:.3f}@{:.3f}ms",i?",":"",
                             fixedPlanPtr->timestep[i],double(fixedPlanPtr->pts100ns[i])/10000.0);
-                    veyra::log::info("fixed-target",std::format("revision={} mode=afg targetFps={:.2f} cadence={} buffer={} contentFps={:.2f} sourceMs={:.3f} periodMs={:.3f} frames={} timestep[{}/{}]={} realSlotMs={:.3f} snapMs={:.3f} generatedFps={:.2f} fgGpuP95Ms={:.3f} loadCap={} bypass={} reason={} intervals={} generated={} droppedCap={} droppedNear={} droppedLoad={} loadLimitedPairs={} resyncs={} bypassLong={} bypassAtTarget={} bypassOff={} (frames = generated frames this pair; timestep[i]@ms = VFG Timestep and grid presentation time; realSlotMs = presentation time of the real frame; snapMs = delay the fixed cadence added to it; loadCap = frames per pair the measured GPU cost affords, applied only when below maxRuns; generatedFps is measured, not the target)",
+                    veyra::log::info("fixed-target",std::format("revision={} mode=afg targetFps={:.2f} cadence={} buffer={} contentFps={:.2f} sourceMs={:.3f} periodMs={:.3f} frames={} timestep[{}/{}]={} realSlotMs={:.3f} snapMs={:.3f} guardMs={:.3f} generatedFps={:.2f} fgGpuP95Ms={:.3f} loadCap={} bypass={} reason={} intervals={} generated={} droppedCap={} droppedNear={} droppedLoad={} loadLimitedPairs={} resyncs={} bypassLong={} bypassAtTarget={} bypassOff={} (frames = generated frames this pair; timestep[i]@ms = VFG Timestep and grid presentation time; realSlotMs = presentation time of the real frame; snapMs = delay the fixed cadence added to it; guardMs = lookahead added to every frame, in whole periods (a generated frame cannot exist before its second real frame); loadCap = frames per pair the measured GPU cost affords, applied only when below maxRuns; generatedFps is measured, not the target)",
                         options.settings.revision,options.settings.fgFixedTarget.targetFps,
                         options.settings.fgFixedTarget.cadence==FixedTargetCadence::Latency?"latency":"fixed",
                         options.settings.fgFixedTarget.buffer==FixedTargetBufferPolicy::Tight?"tight":
                         options.settings.fgFixedTarget.buffer==FixedTargetBufferPolicy::Relaxed?"relaxed":"balanced",
                         pairContentFps,st.lastSpanMs,st.lastPeriodMs,
                         fixedPlanPtr->count,fixedPlanPtr->count,fixedPlanPtr->outputMultiplier-1,slots,
-                        double(fixedPlanPtr->realPts100ns>0?fixedPlanPtr->realPts100ns:0)/10000.0,st.lastSnapMs,
+                        double(fixedPlanPtr->realPts100ns>0?fixedPlanPtr->realPts100ns:0)/10000.0,st.lastSnapMs,st.lastGuardMs,
                         afgRateFps,fgP95,fixedTarget.effectiveMaxRuns(),
                         fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.generated,st.droppedCap,st.droppedNear,st.droppedLoad,st.loadLimitedPairs,st.resyncs,st.bypassLong,st.bypassAtTarget,st.bypassOff));
                 }

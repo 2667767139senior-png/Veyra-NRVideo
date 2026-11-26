@@ -88,6 +88,9 @@ struct AfgStatus {
     double generatedFps=0;
     // Delay the cadence policy added to the real frame, in ms (fixed cadence only).
     double snapMs=0;
+    // Lookahead added to every frame, in ms: the price of putting generated frames
+    // on a grid at all, since one of them cannot exist before its second real frame.
+    double guardMs=0;
     uint64_t generated=0,droppedCap=0,droppedNear=0,droppedLoad=0,resyncs=0;
     uint64_t bypassLong=0,bypassAtTarget=0,bypassOff=0;
     // Interval between our own successful presents (AfgOutputPace). This is the
