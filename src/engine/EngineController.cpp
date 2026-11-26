@@ -3228,10 +3228,11 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     static uint64_t nextFixedTargetRefusalLog=0;
                     if(host100ns()>=nextFixedTargetRefusalLog){
                         nextFixedTargetRefusalLog=host100ns()+10000000;
-                        veyra::log::warn("fixed-target",std::format("mode=on but not running: fg={} backend={} image={} presentSink={} liveMultiplier={} usesFg={} (fix the named gate; the mode itself is enabled)",
+                        veyra::log::warn("fixed-target",std::format("mode=on but not running: fg={} backend={} image={} presentSink={} liveMultiplier={} usesFg={} timestep={} (fix the named gate; the mode itself is enabled. timestep=0 means the installed VFG core has no Timestep parameter, which AFG requires)",
                             options.fg?1:0,int(options.settings.frameGenerationBackend),isImage?1:0,
                             presentSinkFrameGeneration(options.settings.frameGenerationBackend)?1:0,
-                            options.settings.liveMultiplier(),options.settings.usesFrameGeneration()?1:0));
+                            options.settings.liveMultiplier(),options.settings.usesFrameGeneration()?1:0,
+                            graph->vfgTimestepAvailable()?1:0));
                     }
                 }
                 // Live output hint: the panel cannot show more than one new picture

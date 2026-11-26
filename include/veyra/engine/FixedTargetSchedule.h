@@ -161,7 +161,9 @@ public:
     // a source that already runs at or above the target.
     FixedTargetPlan plan(int64_t a100ns,int64_t b100ns,double measuredContentFps){
         FixedTargetPlan out;
-        if(!config_.enabled){out.reason="off";return out;}
+        // Off is a bypass like any other: nothing is planned, and the log line reads
+        // the same field whatever the reason was.
+        if(!config_.enabled){out.bypass=true;out.reason="off";return out;}
         // A zero target is the panel's "insert nothing" value; catching it here
         // keeps the conversion to a period out of a degenerate range.
         if(!(config_.targetFps>0.0)){
@@ -213,8 +215,10 @@ public:
         // every few pairs), which is a hole in the cadence - the one thing this
         // mode exists to prevent. A frame 0.2 ms from A is a repeat, not a hole.
         constexpr double minT=0.005;
-        std::array<int64_t,Capacity> pts{};
-        std::array<double,Capacity> steps{};
+        // Local scratch: one slot per tick the plan can hold.
+        constexpr unsigned kCap=FixedTargetPlan::Capacity;
+        std::array<int64_t,kCap> pts{};
+        std::array<double,kCap> steps{};
         unsigned found=0;
         for(long long index=lastSlot_+1;index<slotB;++index){
             const int64_t at=slotTime(index);
@@ -225,7 +229,7 @@ public:
             // not. (At 160 FPS this fires on about 1% of slots.)
             if(t<=0.0||t>=1.0){++out.droppedNear;++stats_.droppedNear;continue;}
             t=std::clamp(t,minT,1.0-minT);
-            if(found==Capacity){++out.droppedCap;++stats_.droppedCap;continue;}
+            if(found==kCap){++out.droppedCap;++stats_.droppedCap;continue;}
             pts[found]=at;steps[found]=t;++found;
         }
         unsigned first=0;

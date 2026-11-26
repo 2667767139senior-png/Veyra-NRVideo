@@ -246,7 +246,10 @@ int main() {
         check(exact, "5 min at 29.97 -> 50: generated slots never drift off the grid");
         check(bounded, "5 min at 29.97 -> 50: real frames stay on the grid too");
         const auto st = s.stats();
-        const double expected = 9000.0 * span / 1000.0 * 50.0 + 9000.0;
+        // Total presented frames: 300.3 s of output at 50 FPS. The real frames are
+        // 9000 of those, so generated = total - 9000. (Adding the real frames to
+        // both sides again used to double count them and fail by 37%.)
+        const double expected = 9000.0 * span / 1000.0 * 50.0;
         const double actual = double(st.generated) + 9000.0;
         check(std::abs(actual - expected) / expected < 0.01,
               "5 min at 29.97 -> 50: output count matches the target rate within 1%");
