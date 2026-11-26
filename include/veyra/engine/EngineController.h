@@ -119,6 +119,10 @@ struct AfgStatus {
     // output cadence as delivered, not as planned.
     unsigned paceSamples=0,offCadence=0;
     double p50Ms=0,p95Ms=0,p99Ms=0,stddevMs=0;
+    // |Present interval - target period|: the acceptance metric from the spec
+    // (P95 <= 1 ms, P99 <= 2 ms). An interval percentile and a deviation
+    // percentile answer different questions, and only the second one is "uniform".
+    double devP50Ms=0,devP95Ms=0,devP99Ms=0;
     // VFG's measured per-frame GPU cost (Fg1 P95) and the share of the output
     // period it takes; >=1 means the GPU cannot fill the target.
     double fgGpuP95Ms=0;

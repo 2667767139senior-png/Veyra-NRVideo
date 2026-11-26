@@ -3544,6 +3544,11 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 const auto currentReflexFrame=(!paused_&&!isImage)?presenter->beginReflex():0;
                 if(!isImage&&GetEnvironmentVariableW(L"VEYRA_TEST_VIDEO_WORK_MS",testWork,16))std::this_thread::sleep_for(std::chrono::milliseconds(std::clamp(_wtoi(testWork),0,150)));
                 loopTrace.mark("prepare");
+                // The panel's rate is a property of the output chain, not of the
+                // source. Read it once here so the slot ledger and the per-frame
+                // trace quote the same value as the display-fg hint. A target above
+                // this can be Submitted at that rate but cannot be scanned out.
+                const double afgDisplayHz=displayFgTestHz>0?displayFgTestHz:presenter->displayRefreshHz();
                 if(!presenter->beginSourceProcessing()){status(L"XeSS processing timing failed",true);break;}
                 bool processed=false;{
                     processWaitBase=ring.cpuWaitCount();processWaitMsBase=ring.cpuWaitMilliseconds();processSubmitBase=ring.submitCount();
@@ -3569,8 +3574,9 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         std::string hist;
                         for(unsigned i=0;i<AfgOutputPace::Buckets;++i)
                             if(pace.histogram[i])hist+=std::format("{}{:.0f}-{:.0f}ms={}",hist.empty()?"":" ",double(i)*pace.bucketMs,double(i+1)*pace.bucketMs,pace.histogram[i]);
-                        veyra::log::info("afg-output",std::format("targetFps={} samples={} intervalMs p50={:.2f} p95={:.2f} p99={:.2f} mean={:.2f} sd={:.2f} offCadence={} tail={} (measured between successful Present calls; offCadence counts intervals further than 10% from 1000/targetFps; tail is the histogram of intervals, last bucket open-ended)",
-                            options.settings.fgFixedTarget.targetFps,pace.samples,pace.p50,pace.p95,pace.p99,pace.mean,pace.stddev,pace.offCadence,hist));
+                        veyra::log::info("afg-output",std::format("targetFps={} samples={} intervalMs p50={:.2f} p95={:.2f} p99={:.2f} mean={:.2f} sd={:.2f} devMs p50={:.2f} p95={:.2f} p99={:.2f} offCadence={} tail={} (measured between successful Present calls; devMs is |interval - 1000/targetFps|, the acceptance metric, because a correct mean with a 7 ms spread is not uniform; offCadence counts intervals further than 10% from the target period; tail is the histogram of intervals, last bucket open-ended)",
+                            options.settings.fgFixedTarget.targetFps,pace.samples,pace.p50,pace.p95,pace.p99,pace.mean,pace.stddev,
+                            pace.devP50,pace.devP95,pace.devP99,pace.offCadence,hist));
                     }
                     nextFixedTargetLog=host100ns()+10000000;
                     const auto& st=fixedTarget.stats();
@@ -3688,6 +3694,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         afg.bypassLong=st.bypassLong;afg.bypassAtTarget=st.bypassAtTarget;afg.bypassOff=st.bypassOff;
                         afg.paceSamples=pace.samples;afg.offCadence=pace.offCadence;
                         afg.p50Ms=pace.p50;afg.p95Ms=pace.p95;afg.p99Ms=pace.p99;afg.stddevMs=pace.stddev;
+                        afg.devP50Ms=pace.devP50;afg.devP95Ms=pace.devP95;afg.devP99Ms=pace.devP99;
                         afg.fgGpuP95Ms=fgP95;
                         afg.loadCap=fixedTarget.effectiveMaxRuns();afg.loadCapChanges=afgLoadChanges;
                         afg.slotsPlanned=afgSlotsPlanned;
@@ -3700,11 +3707,11 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                             afgSlotsDroppedLate+afgSlotsDroppedCapacity+afgSlotsDroppedFailed;
                         afg.slotsMissing=afgSlotsPlanned>accounted?afgSlotsPlanned-accounted:0;
                         afg.overloadPairs=afgOverloadPairs;
-                        afg.displayHz=refreshHz;
+                        afg.displayHz=afgDisplayHz;
                         // A vsynced flip chain can only scan out a rate the panel can
                         // hit. Saying so here is the difference between "the scheduler
                         // held 50 FPS" and "the panel showed 50 FPS".
-                        afg.targetAboveRefresh=refreshHz>1.0&&targetFps>refreshHz+0.5;
+                        afg.targetAboveRefresh=afgDisplayHz>1.0&&targetFps>afgDisplayHz+0.5;
                     }
                     afgStatusPublished=true;
                     // One line per second, enough to reconstruct the grid: slot times
@@ -3737,7 +3744,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         const uint64_t accounted=rp+gp+dl+dc+df;
                         veyra::log::info("afg-slots",std::format("targetFps={:.2f} planned={} real={} generated={} droppedLate={} droppedCapacity={} droppedFailed={} missing={} overloadPairs={} presentedFps={:.2f} displayHz={:.3f} aboveRefresh={} (per-slot ledger for this window: a slot is real, generated, or dropped with a reason; missing = asked for but never accounted for)",
                             targetFps,planned,rp,gp,dl,dc,df,planned>accounted?planned-accounted:0,
-                            afgOverloadPairs,double(rp+gp),refreshHz,refreshHz>1.0&&targetFps>refreshHz+0.5?1:0));
+                            afgOverloadPairs,double(rp+gp),afgDisplayHz,afgDisplayHz>1.0&&targetFps>afgDisplayHz+0.5?1:0));
                         p0=afgSlotsPlanned;r0=afgSlotsRealPresented;g0=afgSlotsGeneratedPresented;
                         l0=afgSlotsDroppedLate;c0=afgSlotsDroppedCapacity;f0=afgSlotsDroppedFailed;
                     }
@@ -3995,7 +4002,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
 #ifdef VEYRA_ENABLE_XBOX
                         &xb,
 #endif
-                        &seekDecoded,&seekStarted,&seekDemuxDone,&audio,&audioPipe,&audioStarted,&cadence,&ctx,&fileAudioAlignPending,&fileAwaitingVideo,&fileInputEnded,&generatedDropCap,&generatedDropCapacity,&generatedDropDeadline,&playbackRate,&frameFlow,&graph,&host100ns,&isCapture,&isImage,&liveArrival,&livePresent,&liveScheduler,&nextFgDeadlineLog,&nowMs,&options,&pendingCompletions,&physicalCapture,&processingGraph,&presentEntryDeviation,&presentReturnDeviation,&presentationEffective,&presentationGeneration,&presentationSkippedGenerated,&presenter,&ring,&runSessionId,&seekPreviewPending,&observeFrameReady,&traceSubframe,&traceCpu,&captureStarting,&rawFirstPresent,&lastRawPresent,&firstEnhancedRevision,&retiredCapturePreview,&capturePreviewWindow,&rawSurfaceRevealed,privateTrace,traceSubframes,watch,step,timeline,captureArrival,sourceArrivalHost=pkt.arrivalHost100ns,baselineReady,delayEnhanced,activeSeekId,lineage,jobGeneration,rereadCached,sourceIntervalMs,submitThenPresent,generatedGrace=liveGeneratedGrace,smoothedCapacity=smoothTransportAnchor||smoothContentAnchor,halfRate,captureClockCorrected,driverPts100ns,flow=frameFlow,&deadlineMargin,marginPair,pairExtra,&afgPace,&afgLateGenerated,&afgLateReal,&fixedTarget,&fixedPlanPtr,refreshHz,afgTrace,&afgSlotsPlanned,&afgSlotsRealPresented,&afgSlotsGeneratedPresented,&afgSlotsDroppedLate,&afgSlotsDroppedCapacity,&afgSlotsDroppedFailed,&afgOverloadPairs](int64_t now)->LiveGpuScheduler::Step{
+                        &seekDecoded,&seekStarted,&seekDemuxDone,&audio,&audioPipe,&audioStarted,&cadence,&ctx,&fileAudioAlignPending,&fileAwaitingVideo,&fileInputEnded,&generatedDropCap,&generatedDropCapacity,&generatedDropDeadline,&playbackRate,&frameFlow,&graph,&host100ns,&isCapture,&isImage,&liveArrival,&livePresent,&liveScheduler,&nextFgDeadlineLog,&nowMs,&options,&pendingCompletions,&physicalCapture,&processingGraph,&presentEntryDeviation,&presentReturnDeviation,&presentationEffective,&presentationGeneration,&presentationSkippedGenerated,&presenter,&ring,&runSessionId,&seekPreviewPending,&observeFrameReady,&traceSubframe,&traceCpu,&captureStarting,&rawFirstPresent,&lastRawPresent,&firstEnhancedRevision,&retiredCapturePreview,&capturePreviewWindow,&rawSurfaceRevealed,privateTrace,traceSubframes,watch,step,timeline,captureArrival,sourceArrivalHost=pkt.arrivalHost100ns,baselineReady,delayEnhanced,activeSeekId,lineage,jobGeneration,rereadCached,sourceIntervalMs,submitThenPresent,generatedGrace=liveGeneratedGrace,smoothedCapacity=smoothTransportAnchor||smoothContentAnchor,halfRate,captureClockCorrected,driverPts100ns,flow=frameFlow,&deadlineMargin,marginPair,pairExtra,&afgPace,&afgLateGenerated,&afgLateReal,&fixedTarget,&fixedPlanPtr,afgDisplayHz,afgTrace,&afgSlotsPlanned,&afgSlotsRealPresented,&afgSlotsGeneratedPresented,&afgSlotsDroppedLate,&afgSlotsDroppedCapacity,&afgSlotsDroppedFailed,&afgOverloadPairs](int64_t now)->LiveGpuScheduler::Step{
 
                         using State=LiveGpuScheduler::State;auto& batch=watch->output;auto& s=*step;
                         auto updatePending=[&](LiveStepState*){
@@ -4182,7 +4189,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                             item.identity.sourceFrameId,generated?"generated":"real",item.subframe,slot,
                                             double(item.pts100ns)/10000.0,step,double(fixedPlanPtr?fixedPlanPtr->guard100ns:0)/10000.0,
                                             readyAt?double(readyAt-presentBeginHost)/10000.0:-1000.0,
-                                            double(presentBeginHost-rawFirstPresent)/10000.0,lateMs,refreshHz));
+                                            double(presentBeginHost-rawFirstPresent)/10000.0,lateMs,afgDisplayHz));
                                     }
                                 }
                                 if(!rawSurfaceRevealed&&retiredCapturePreview&&retiredCapturePreview->presenter){

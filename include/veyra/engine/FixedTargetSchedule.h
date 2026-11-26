@@ -443,11 +443,17 @@ public:
         // stall. Counted against the target period, with a 10% tolerance, inside
         // the same window the percentiles come from.
         unsigned offCadence=0;
+        // P50/P95/P99 of |interval - period|: the acceptance metric, because an
+        // interval distribution and a period deviation are not the same question.
+        // A run can hold a mean of exactly 20 ms and still be 7 ms off 40% of the
+        // time, and only this number says so.
+        double devP50=0,devP95=0,devP99=0;
         std::array<unsigned,Buckets> histogram{};
         double bucketMs=2.0;
     };
     void reset(){count_=0;head_=0;last_=0;}
     void record(int64_t now,double periodMs){
+        if(periodMs>0.0)period_=periodMs;
         if(last_>0&&now>last_){
             const double interval=double(now-last_)/10000.0;
             if(interval>0.0&&interval<1000.0){
@@ -463,17 +469,25 @@ public:
         out.samples=count_;
         if(!count_)return out;
         std::array<double,Capacity> sorted{};
+        // Deviation is kept in its own array: sorting the intervals and sorting
+        // their distance from the period are different orderings, and the second
+        // one is the one that answers "how far off is this frame".
+        std::array<double,Capacity> dev{};
         double sum=0;
         for(unsigned i=0;i<count_;++i){
             const double v=samples_[(head_+i)%Capacity];
             sorted[i]=v;sum+=v;
+            dev[i]=period_>0.0?std::abs(v-period_):0.0;
             out.offCadence+=off_[(head_+i)%Capacity]?1u:0u;
             const double bucket=v/out.bucketMs;
             ++out.histogram[bucket>=double(Buckets-1)?Buckets-1:unsigned(bucket)];
         }
         std::sort(sorted.begin(),sorted.begin()+count_);
+        std::sort(dev.begin(),dev.begin()+count_);
         const auto at=[&](double q){return sorted[std::min(count_-1,unsigned(q*double(count_-1)+0.5))];};
+        const auto devAt=[&](double q){return dev[std::min(count_-1,unsigned(q*double(count_-1)+0.5))];};
         out.p50=at(0.50);out.p95=at(0.95);out.p99=at(0.99);
+        out.devP50=devAt(0.50);out.devP95=devAt(0.95);out.devP99=devAt(0.99);
         out.mean=sum/double(count_);
         double var=0;
         for(unsigned i=0;i<count_;++i){const double d=sorted[i]-out.mean;var+=d*d;}
@@ -485,6 +499,9 @@ private:
     std::array<uint8_t,Capacity> off_{};
     unsigned count_=0,head_=0;
     int64_t last_=0;
+    // The period the deviations are measured against, remembered from record():
+    // summary() has no argument, and a deviation without its reference is noise.
+    double period_=0.0;
 };
 
 // How late each output frame reached Present, measured against its own slot.

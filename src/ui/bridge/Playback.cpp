@@ -157,6 +157,12 @@ QString QmlPlayerBridge::afgStatusText() const {
         lines << tr("提交间隔 P50 %1 · P95 %2 · P99 %3 ms · 偏离 %4/%5")
                      .arg(a.p50Ms, 0, 'f', 2).arg(a.p95Ms, 0, 'f', 2).arg(a.p99Ms, 0, 'f', 2)
                      .arg(a.offCadence).arg(a.paceSamples);
+    // Deviation from the target period, which is what "uniform" means. A mean of
+    // exactly 20 ms with a P95 of 7 ms is the failure this line makes visible.
+    if (a.paceSamples > 8)
+        lines << tr("间隔偏差 P50 %1 · P95 %2 · P99 %3 ms（相对 %4 ms，验收线 1 / 2 ms）")
+                     .arg(a.devP50Ms, 0, 'f', 2).arg(a.devP95Ms, 0, 'f', 2).arg(a.devP99Ms, 0, 'f', 2)
+                     .arg(a.periodMs, 0, 'f', 1);
     if (!a.latencyCadence && a.guardMs > 0.0)
         lines << tr("前瞻 %1 ms（%2 个输出周期，其中自适应 %3）：生成帧要等第二个真实帧才能存在，这段延迟买的是均匀间隔")
                      .arg(a.guardMs, 0, 'f', 1)
