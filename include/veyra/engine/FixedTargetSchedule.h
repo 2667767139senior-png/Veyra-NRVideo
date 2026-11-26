@@ -325,11 +325,20 @@ public:
             return origin_+static_cast<int64_t>(std::llround(double(index)*period));
         };
         // First slot at or after b: the real frame is never shown early.
-        // The epsilon matters: when b lands exactly on a slot (it does every few
-        // pairs whenever 1000/targetFps is not a whole 100 ns count) the division
-        // can come out as 18.000000000000004 and ceil would hand this pair an
-        // empty plan plus a real frame one slot late - a 40 ms hole at 50 FPS.
-        long long slotB=static_cast<long long>(std::ceil(double(b100ns-origin_)/period-1e-6));
+        // Timestamps are whole 100 ns ticks but the period is not (16.667 ms at
+        // 60 FPS). A source frame that lands on a slot can therefore be rounded
+        // a tick *past* it; a plain ceil then puts the real frame one whole
+        // period late and drops the slot at b as an endpoint - the measured
+        // 33/16 ms alternation at 30->60. Treat a slot within two ticks as b's
+        // own slot, otherwise snap up. This is a quantization tolerance, not a
+        // change to the grid: every slot still comes from origin + n*period.
+        const double gridPosition=double(b100ns-origin_)/period;
+        const long long candidate=std::llround(gridPosition);
+        long long slotB;
+        if(candidate>=0&&std::llabs(b100ns-slotTime(candidate))<=2)
+            slotB=candidate;
+        else
+            slotB=static_cast<long long>(std::ceil(gridPosition));
         // Never behind the previous real frame: two inputs faster than the target
         // would otherwise claim the same slot and the batch would go backwards.
         if(slotB<=lastSlot_)slotB=lastSlot_+1;

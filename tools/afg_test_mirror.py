@@ -150,7 +150,14 @@ class Scheduler:
         def slot_time(index):
             return self.origin + int(round(index * period))
 
-        slot_b = int(math.ceil((b - self.origin) / period - 1e-6))
+        # Two 100 ns ticks of slack for a source time that was rounded to the
+        # tick and therefore sits just past the exact slot (30->60: 1 in 3 pairs).
+        grid_position = (b - self.origin) / period
+        candidate = int(math.floor(grid_position + 0.5))
+        if candidate >= 0 and abs(b - (self.origin + int(round(candidate * period)))) <= 2:
+            slot_b = candidate
+        else:
+            slot_b = math.ceil(grid_position)
         if slot_b <= self.last_slot:
             slot_b = self.last_slot + 1
         if slot_b < 1:
@@ -270,6 +277,24 @@ allp = presented(pairs)
 check(len(allp) == 500, f"30->50: 500 presented frames in 10 s (got {len(allp)})")
 check(all(allp[i] - allp[i - 1] == PERIOD for i in range(1, len(allp))),
       "30->50: presented interval is exactly 20 ms")
+
+# --- 30 -> 60: whole-ratio input must not trip over tick quantization --------
+s = Scheduler(Config(enabled=True, target=60.0))
+out60 = []
+for i in range(1, 121):
+    # Compute each source time from the exact grid; accumulating a truncated
+    # 33.333 ms would build 4 ms of error over 120 pairs and test the harness
+    # instead of the scheduler.
+    a, b = ms((i - 1) * 100.0 / 3.0), ms(i * 100.0 / 3.0)
+    out60.append((a, b, s.plan(a, b, 30.0)))
+check(all(p.count == 1 for _, _, p in out60),
+      "30->60: one generated frame in every pair")
+check(all(abs(p.real - p.guard - b) <= 2 for _, b, p in out60),
+      "30->60: the real frame lands on its own source slot")
+p60 = presented(out60)
+step = ms(100.0 / 6.0)
+check(all(abs((p60[i] - p60[i - 1]) - step) <= 1 for i in range(1, len(p60))),
+      "30->60: output interval is one 60 FPS period (within a tick)")
 
 # --- 25 -> 50 ---------------------------------------------------------------
 s, pairs = run([40.0] * 40, content_fps=25.0)

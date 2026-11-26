@@ -131,6 +131,34 @@ int main() {
         check(even, "30->50: presented interval is exactly 20 ms, not an average of 20 ms");
     }
 
+    // 30 -> 60: a whole-ratio input used to lose one slot in every third pair.
+    // At 16.667 ms a slot is not a whole number of 100 ns ticks, so a source
+    // time rounded to the tick can sit just past its own slot; ceil pushed the
+    // real frame a whole period late and the slot at B was dropped as an
+    // endpoint. The measured result was a 33/16 ms alternation.
+    {
+        FixedTargetScheduler s;
+        s.configure(config(60.0));
+        std::vector<Pair> pairs;
+        for (int i = 1; i <= 120; ++i) {
+            const int64_t a = ms((i - 1) * 100.0 / 3.0), b = ms(i * 100.0 / 3.0);
+            pairs.push_back({a, b, s.plan(a, b, 30.0)});
+        }
+        bool every = true, onGrid = true;
+        for (const auto& p : pairs) {
+            every = every && p.plan.count == 1;
+            onGrid = onGrid && std::llabs(p.plan.realPts100ns - p.plan.guard100ns - p.b) <= 2;
+        }
+        const auto all = presented(pairs);
+        const int64_t step = ms(100.0 / 6.0);
+        bool even = all.pts.size() > 1;
+        for (size_t i = 1; i < all.pts.size(); ++i)
+            if (std::llabs(all.pts[i] - all.pts[i - 1] - step) > 1) even = false;
+        check(every, "30->60: one generated frame in every pair");
+        check(onGrid, "30->60: the real frame lands on its own source slot");
+        check(even, "30->60: output interval is one 60 FPS period (within a tick)");
+    }
+
     // 25 -> 50: 40 ms is exactly two slots, so every pair generates one frame at
     // t = 0.5 and the real frame needs no snap at all.
     {
