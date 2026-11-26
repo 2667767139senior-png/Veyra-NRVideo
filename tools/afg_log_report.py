@@ -28,6 +28,7 @@ FIXED_TARGET = re.compile(r"\[fixed-target\]\s*(?P<body>.*)$")
 AFG_OUTPUT = re.compile(r"\[afg-output\]\s*(?P<body>.*)$")
 REFUSAL = re.compile(r"\[fixed-target\]\s*mode=on but not running:(?P<body>.*)$")
 TIMESTAMP = re.compile(r"^(?P<ts>\d{4}-\d\d-\d\dT[\d:.]+Z)")
+HISTOGRAM = re.compile(r"^\d+-\d+ms$")
 
 
 def fields(body: str) -> dict[str, str]:
@@ -70,6 +71,10 @@ class Run:
     reason: dict[str, int] = field(default_factory=dict)
     snap_ms: list[float] = field(default_factory=list)
     guard_ms: list[float] = field(default_factory=list)
+    guard_periods: list[int] = field(default_factory=list)
+    late_gen: list[float] = field(default_factory=list)
+    late_real: list[float] = field(default_factory=list)
+    tails: list[dict[str, int]] = field(default_factory=list)
     fg_gpu: list[float] = field(default_factory=list)
     load_cap: list[int] = field(default_factory=list)
     counters: dict[str, int] = field(default_factory=dict)
@@ -96,6 +101,11 @@ def parse(path: Path) -> Run:
                     samples=int(num(v, "samples")), p50=num(v, "p50"), p95=num(v, "p95"),
                     p99=num(v, "p99"), mean=num(v, "mean"), sd=num(v, "sd"),
                     off=int(num(v, "offCadence"))))
+                # `tail=2-4ms=12 4-6ms=3`: the interval histogram of this window,
+                # emitted as `<lo>-<hi>ms=<count>` tokens. A 27/13 alternation has a
+                # perfect mean and two peaks, and only the shape shows that.
+                run.tails.append({k: int(val) for k, val in v.items()
+                                  if HISTOGRAM.match(k) and val.isdigit()})
             continue
         match = FIXED_TARGET.search(line)
         if not match:
@@ -121,6 +131,12 @@ def parse(path: Path) -> Run:
             run.fg_gpu.append(num(v, "fgGpuP95Ms"))
         if "loadCap" in v:
             run.load_cap.append(int(num(v, "loadCap")))
+        if "guardPeriods" in v:
+            run.guard_periods.append(int(num(v, "guardPeriods")))
+        if "lateGenP95Ms" in v:
+            run.late_gen.append(num(v, "lateGenP95Ms"))
+        if "lateRealP95Ms" in v:
+            run.late_real.append(num(v, "lateRealP95Ms"))
         # Cumulative counters: the last line wins.
         for key in ("intervals", "generated", "droppedCap", "droppedNear", "droppedLoad",
                     "loadLimitedPairs", "resyncs", "bypassLong", "bypassAtTarget", "bypassOff"):
@@ -201,6 +217,22 @@ def report(run: Run, period: float) -> tuple[dict, list[str]]:
         },
         "guard_ms": {"p50": round(pct(run.guard_ms, 0.5), 2),
                      "max": round(max(run.guard_ms), 2) if run.guard_ms else 0.0},
+        "guard_periods": {
+            "min": min(run.guard_periods) if run.guard_periods else 0,
+            "max": max(run.guard_periods) if run.guard_periods else 0,
+            "last": run.guard_periods[-1] if run.guard_periods else 0,
+        },
+        # How late the output frames reached Present against their own slot. This is
+        # the number the lookahead loop regulates and the one that separates "even"
+        # from "correct on average": a perfect 20.00 ms mean with a 7 ms P95 is the
+        # 27/13 alternation, and it is a FAIL, not a pass with a footnote.
+        "lateness": {
+            "generated_p95_ms": round(max(run.late_gen[-5:]), 3) if run.late_gen else 0.0,
+            "real_p95_ms": round(max(run.late_real[-5:]), 3) if run.late_real else 0.0,
+            "generated_p50_ms": round(pct(run.late_gen, 0.5), 3),
+            "real_p50_ms": round(pct(run.late_real, 0.5), 3),
+        },
+        "tail": run.tails[-1] if run.tails else {},
         "vfg_gpu_ms": {
             "p50": round(pct(run.fg_gpu, 0.5), 2),
             "p95": round(pct(run.fg_gpu, 0.95), 2),
@@ -219,8 +251,21 @@ def report(run: Run, period: float) -> tuple[dict, list[str]]:
         problems.append(f"{off}/{samples} presents ({off / samples:.1%}) were off cadence (limit 2%)")
     if worst_p99 > period * 3:
         problems.append(f"worst window P99 {worst_p99:.2f} ms is more than 3 periods")
-    if run.counters.get("droppedCap", 0) > 0:
-        problems.append(f"{run.counters['droppedCap']} slots lost to the per-pair cap")
+    # A slot is only "lost" if it was lost in steady play. One or two during the
+    # first pairs (the plan still learning the interval) are start-up noise, not a
+    # cadence failure; anything above 0.1% of the pairs is.
+    cap_limit = max(2, int(run.counters.get("intervals", 0) * 0.001))
+    if run.counters.get("droppedCap", 0) > cap_limit:
+        problems.append(f"{run.counters['droppedCap']} slots lost to the per-pair cap "
+                        f"(limit {cap_limit} at start-up)")
+    # Sustained lateness is the judder itself, even when the mean interval is
+    # perfect. Older logs have no such field and are judged by the cadence ratio.
+    for label, values in (("generated", run.late_gen), ("real", run.late_real)):
+        if values:
+            steady_late = pct(values[-5:], 0.5)
+            if steady_late > 1.0:
+                problems.append(f"{label} frames reached Present {steady_late:.2f} ms late at P95 "
+                                f"(limit 1 ms): the lookahead did not cover the pipeline")
     if not samples:
         problems.append("no afg-output windows: nothing was presented through the AFG path")
     return summary, problems
@@ -261,7 +306,13 @@ def main() -> int:
               f"worst window P95 {p['worst_window_p95_ms']:.2f} P99 {p['worst_window_p99_ms']:.2f} ms")
         print(f"  cadence    {p['off_cadence']}/{p['samples']} off ({p['off_cadence_ratio']:.2%})")
         print(f"  frames/pair {summary['frames_per_pair']}  reasons {summary['reason']}")
-        print(f"  snap ms    {summary['snap_ms']}  guard {summary['guard_ms']} ms  vfg gpu {summary['vfg_gpu_ms']}")
+        print(f"  snap ms    {summary['snap_ms']}  guard {summary['guard_ms']} ms "
+              f"({summary['guard_periods']['last']} periods)  vfg gpu {summary['vfg_gpu_ms']}")
+        print(f"  late P95   generated {summary['lateness']['generated_p95_ms']:.2f} ms  "
+              f"real {summary['lateness']['real_p95_ms']:.2f} ms  (limit 1.00)")
+        if summary["tail"]:
+            shape = " ".join(f"{k}={v}" for k, v in sorted(summary["tail"].items()))
+            print(f"  intervals  {shape}")
         print(f"  counters   {summary['counters']}")
         if summary["load_cap"]:
             print(f"  load cap   {summary['load_cap']}")

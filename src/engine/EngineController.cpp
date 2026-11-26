@@ -1417,6 +1417,15 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             // What actually left the presenter. Recorded on the live Present path
             // only, so the numbers describe this session's output, not the graph.
             AfgOutputPace afgPace;
+            // Lateness of each AFG output frame against its own slot. Split by kind
+            // because they fail for different reasons: a generated frame can only
+            // exist after the pair's second real frame, a real frame after the whole
+            // group, so the two need different amounts of lookahead to hit the grid.
+            AfgLateness afgLateGenerated,afgLateReal;
+            // Consecutive control windows without a miss; the only thing that lets
+            // the lookahead come back down, so it never oscillates per frame.
+            unsigned afgGuardCleanWindows=0;
+            uint64_t afgGuardChanges=0;
             uint64_t nextFixedTargetLog=0;
             // Capture-card FG pairs: automatic deadline margin (0-1 ms) on top of the phase.
             LiveDeadlineMargin deadlineMargin;
@@ -3147,7 +3156,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     nextFgAdmissionLog=now+10000000;if(!admitted)nextFgRejectionLog=now+10000000;
                     veyra::log::info("live-fg-admission",std::format("timeline={} revision={} source={} multiplier={} requestedMultiplier={} admitted={} admittedPairs={} rejectedPairs={} remainingDeadlineMs={:.3f} firstDeadlineMs={:.3f} queuedGpuMs={:.3f} predictedMs={:.3f} elapsedMs={:.3f} blitGpuP95Ms={:.3f} presentCpuP95Ms={:.3f} warmingHistory={} (CPU Present is backpressure, not added GPU cost; firstDeadlineMs=-1 when unused)",timeline,batch.identity.settingsRevision,batch.identity.sourceFrameId,previewFgMultiplier,options.fgMultiplier,admitted,fgAdmittedPairs,fgRejectedPairs,double(deadline-now)/10000,firstDeadline?double(firstDeadline-now)/10000:-1,queuedMs,fgBudget.predicted(now,warmingHistory).value_or(-1),elapsed,blit,livePresent.p95(),warmingHistory));
                 };
-                if(hardFrameReset){fixedTarget.reset();afgPace.reset();}
+                if(hardFrameReset){fixedTarget.reset();afgPace.reset();afgLateGenerated.reset();afgLateReal.reset();afgGuardCleanWindows=0;}
                 if(fgBudgetRevision!=options.settings.revision||hardFrameReset){fgBudget.reset();vfgOverload.reset();vfgCostSettling.reset();vfgChosenFgMs=vfgFastFgMs=0;liveArrival.reset();pairLatency.reset();deadlineMargin.reset();fgRejectionHold.reset();fgBudgetRevision=options.settings.revision;displayFgGate.reset();}
                 previewFgMultiplier=options.fgMultiplier;
                 // An output cap used to only drop candidates at present time, so
@@ -3519,8 +3528,15 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 if(processed)lastProcessedPtsMs=pts;
                 if(processed&&fixedPlanPtr&&host100ns()>=nextFixedTargetLog){
                     const auto pace=afgPace.summary();
-                    if(pace.samples>8)veyra::log::info("afg-output",std::format("targetFps={} samples={} intervalMs p50={:.2f} p95={:.2f} p99={:.2f} mean={:.2f} sd={:.2f} offCadence={} (measured between successful Present calls; offCadence counts intervals further than 10% from 1000/targetFps)",
-                        options.settings.fgFixedTarget.targetFps,pace.samples,pace.p50,pace.p95,pace.p99,pace.mean,pace.stddev,pace.offCadence));
+                    if(pace.samples>8){
+                        // The shape, not just the percentiles: a 27/13 alternation has
+                        // a perfect mean and two peaks, and only the histogram says so.
+                        std::string hist;
+                        for(unsigned i=0;i<AfgOutputPace::Buckets;++i)
+                            if(pace.histogram[i])hist+=std::format("{}{:.0f}-{:.0f}ms={}",hist.empty()?"":" ",double(i)*pace.bucketMs,double(i+1)*pace.bucketMs,pace.histogram[i]);
+                        veyra::log::info("afg-output",std::format("targetFps={} samples={} intervalMs p50={:.2f} p95={:.2f} p99={:.2f} mean={:.2f} sd={:.2f} offCadence={} tail={} (measured between successful Present calls; offCadence counts intervals further than 10% from 1000/targetFps; tail is the histogram of intervals, last bucket open-ended)",
+                            options.settings.fgFixedTarget.targetFps,pace.samples,pace.p50,pace.p95,pace.p99,pace.mean,pace.stddev,pace.offCadence,hist));
+                    }
                     nextFixedTargetLog=host100ns()+10000000;
                     const auto& st=fixedTarget.stats();
                     // GPU load adaptation: how many generated frames one input
@@ -3542,6 +3558,54 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     if(std::isfinite(fgP95)&&fgP95>0.05&&spanMs>0.0)
                         affordable=std::clamp(unsigned(std::floor(spanMs/fgP95)),1u,kFixedTargetMaxTicks);
                     fixedTarget.setLoadCap(options.settings.fgFixedTarget.gpuLoadAdapt?affordable:0u);
+                    // Lookahead control loop. A generated frame between A and B cannot
+                    // exist before B arrives, so its slot is due earlier than the input
+                    // that makes it; the one-interval base guard covers the average
+                    // case and nothing else. On the 2026-11-26 720p30 run the base gave
+                    // 26.7 ms of lead against a measured 24-30 ms graph time and one
+                    // batch in three landed 7 ms late (p50 19.95 / p95 27.11, mean
+                    // exactly 20.00 - the 27/13 alternation this mode exists to remove).
+                    //
+                    // So the guard is raised until the frames that actually reached
+                    // Present stop being late, and only then. It reads the symptom, not
+                    // a model of VFG's cost: that cost measured 4.4 to 30.1 ms on the
+                    // same GPU within one minute, so any constant derived from it would
+                    // be either wrong or permanently oversized.
+                    const double periodMs=targetFps>0.5?1000.0/targetFps:20.0;
+                    const auto lateGen=afgLateGenerated.summary();
+                    const auto lateReal=afgLateReal.summary();
+                    afgLateGenerated.reset();afgLateReal.reset();
+                    const double worstLate=std::max(lateGen.p95,lateReal.p95);
+                    const bool configFixedCadence=options.settings.fgFixedTarget.cadence==FixedTargetCadence::Fixed;
+                    const unsigned guardBefore=fixedTarget.guardExtraPeriods();
+                    unsigned guardExtra=guardBefore;
+                    // The latency cadence takes no lookahead at all (its real frames keep
+                    // their own timestamps, so shifting the generated ones would put them
+                    // behind the next real frame). Regulating a guard it does not use
+                    // would only fill the log with a value that means nothing.
+                    if(configFixedCadence&&lateGen.samples+lateReal.samples>=6){
+                        if(worstLate>AfgLateness::kLateMs){
+                            // One period of lookahead per period of lateness, plus one
+                            // for the frames that were not sampled, capped at two per
+                            // window so a single stall cannot jump straight to the ceiling.
+                            const unsigned need=unsigned(std::ceil(worstLate/std::max(1.0,periodMs)-1e-9));
+                            guardExtra=std::min(kFixedTargetMaxGuardPeriods-1u,
+                                guardBefore+std::min(2u,std::max(1u,need)));
+                            afgGuardCleanWindows=0;
+                        }else if(guardExtra>0&&++afgGuardCleanWindows>=4){
+                            // Four clean seconds is the evidence for giving a period
+                            // back; a shorter window made the loop chase its own tail.
+                            --guardExtra;afgGuardCleanWindows=0;
+                        }
+                    }
+                    fixedTarget.setGuardExtraPeriods(guardExtra);
+                    const unsigned basePeriods=fixedTarget.guardBasePeriods();
+                    if(guardExtra!=guardBefore){
+                        ++afgGuardChanges;
+                        veyra::log::info("afg-guard",std::format("revision={} periods={}->{} base={} extra={}->{} lateGenP95Ms={:.3f} lateRealP95Ms={:.3f} samples={}/{} periodMs={:.3f} changes={} (lookahead raised or relaxed from measured present lateness; a change shifts the whole output by whole periods and never accumulates)",
+                            options.settings.revision,basePeriods+guardBefore,basePeriods+guardExtra,basePeriods,
+                            guardBefore,guardExtra,lateGen.p95,lateReal.p95,lateGen.samples,lateReal.samples,periodMs,afgGuardChanges));
+                    }
                     // Generated frames per second of source time. Measured between
                     // two log ticks, so a broken cadence cannot hide behind the
                     // target: this is what the scheduler really inserted.
@@ -3562,6 +3626,9 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         afg.sourceFps=pairContentFps;
                         afg.generatedFps=afgRateFps;
                         afg.snapMs=st.lastSnapMs;afg.guardMs=st.lastGuardMs;
+                        afg.guardPeriods=st.lastGuardPeriods;afg.guardExtra=fixedTarget.guardExtraPeriods();
+                        afg.lateGenP95Ms=lateGen.p95;afg.lateRealP95Ms=lateReal.p95;
+                        afg.guardChanges=afgGuardChanges;
                         afg.generated=st.generated;afg.droppedCap=st.droppedCap;afg.droppedNear=st.droppedNear;
                         afg.droppedLoad=st.droppedLoad;afg.resyncs=st.resyncs;
                         afg.bypassLong=st.bypassLong;afg.bypassAtTarget=st.bypassAtTarget;afg.bypassOff=st.bypassOff;
@@ -3577,7 +3644,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     for(unsigned i=0;i<fixedPlanPtr->count&&i<4;++i)
                         slots+=std::format("{}{:.3f}@{:.3f}ms",i?",":"",
                             fixedPlanPtr->timestep[i],double(fixedPlanPtr->pts100ns[i])/10000.0);
-                    veyra::log::info("fixed-target",std::format("revision={} mode=afg targetFps={:.2f} cadence={} buffer={} contentFps={:.2f} sourceMs={:.3f} periodMs={:.3f} frames={} timestep[{}/{}]={} realSlotMs={:.3f} snapMs={:.3f} guardMs={:.3f} generatedFps={:.2f} fgGpuP95Ms={:.3f} loadCap={} bypass={} reason={} intervals={} generated={} droppedCap={} droppedNear={} droppedLoad={} loadLimitedPairs={} resyncs={} bypassLong={} bypassAtTarget={} bypassOff={} (frames = generated frames this pair; timestep[i]@ms = VFG Timestep and grid presentation time; realSlotMs = presentation time of the real frame; snapMs = delay the fixed cadence added to it; guardMs = lookahead added to every frame, in whole periods (a generated frame cannot exist before its second real frame); loadCap = frames per pair the measured GPU cost affords, applied only when below maxRuns; generatedFps is measured, not the target)",
+                    veyra::log::info("fixed-target",std::format("revision={} mode=afg targetFps={:.2f} cadence={} buffer={} contentFps={:.2f} sourceMs={:.3f} periodMs={:.3f} frames={} timestep[{}/{}]={} realSlotMs={:.3f} snapMs={:.3f} guardMs={:.3f} guardPeriods={} guardExtra={} lateGenP95Ms={:.3f} lateRealP95Ms={:.3f} generatedFps={:.2f} fgGpuP95Ms={:.3f} loadCap={} bypass={} reason={} intervals={} generated={} droppedCap={} droppedNear={} droppedLoad={} loadLimitedPairs={} resyncs={} bypassLong={} bypassAtTarget={} bypassOff={} (frames = generated frames this pair; timestep[i]@ms = VFG Timestep and grid presentation time; realSlotMs = presentation time of the real frame; snapMs = delay the fixed cadence added to it; guardMs/guardPeriods = lookahead added to every frame, base one input interval plus the measured extra; lateGen/lateRealP95Ms = how late the last window's output frames reached Present against their own slot, the quantity the lookahead loop regulates; loadCap = frames per pair the measured GPU cost affords, applied only when below maxRuns; generatedFps is measured, not the target)",
                         options.settings.revision,options.settings.fgFixedTarget.targetFps,
                         options.settings.fgFixedTarget.cadence==FixedTargetCadence::Latency?"latency":"fixed",
                         options.settings.fgFixedTarget.buffer==FixedTargetBufferPolicy::Tight?"tight":
@@ -3585,6 +3652,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         pairContentFps,st.lastSpanMs,st.lastPeriodMs,
                         fixedPlanPtr->count,fixedPlanPtr->count,fixedPlanPtr->outputMultiplier-1,slots,
                         double(fixedPlanPtr->realPts100ns>0?fixedPlanPtr->realPts100ns:0)/10000.0,st.lastSnapMs,st.lastGuardMs,
+                        st.lastGuardPeriods,fixedTarget.guardExtraPeriods(),lateGen.p95,lateReal.p95,
                         afgRateFps,fgP95,fixedTarget.effectiveMaxRuns(),
                         fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.generated,st.droppedCap,st.droppedNear,st.droppedLoad,st.loadLimitedPairs,st.resyncs,st.bypassLong,st.bypassAtTarget,st.bypassOff));
                 }
@@ -4032,6 +4100,20 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                     if(lineage){event.sourceA=lineage->a.identity.sourceFrameId;event.sourceAHost=lineage->a.host100ns;}
                                 }
                                 Logger::instance().recordFrame(event);
+                                // AFG: how far this output frame landed from its own
+                                // slot. This is the only input to the lookahead loop,
+                                // so it is fed on every presented frame of the mode,
+                                // split by kind: capture against the paced deadline,
+                                // file playback against the media clock it is paced to.
+                                if(fixedTarget.config().enabled&&options.fg){
+                                    const bool signed_=isCapture?timeline.paced():deviationValid;
+                                    if(signed_){
+                                        const double lateness=isCapture?
+                                            double(optionalNow-timeline.deadline(item.pts100ns))/10000.0:
+                                            entryDeviation;
+                                        (generated?afgLateGenerated:afgLateReal).add(lateness);
+                                    }
+                                }
                                 if(deviationValid){presentEntryDeviation.add(std::abs(entryDeviation));presentReturnDeviation.add(std::abs(returnDeviation));}
                                 if(veyra::log::verboseFrameLogs())veyra::log::info("submit",std::format("batch={} epoch={} revision={} subframe={} pts100ns={} host100ns={} fence={} (submission, display unmeasured)",batch.batch.batchId,item.identity.epoch,item.identity.settingsRevision,item.subframe,item.pts100ns,host100ns(),item.lease->consumerFence));
                             }

@@ -308,6 +308,68 @@ int main() {
         check(noGuard, "guard: the latency policy adds none");
     }
 
+    // Adaptive lookahead: the engine raises the guard by whole periods from the
+    // lateness it measured (the loop in EngineController). A change has to reach
+    // every frame of the run, stay on the lattice, and only ever move forward.
+    {
+        FixedTargetScheduler s;
+        s.configure(config(50.0));
+        int64_t a = ms(1000);
+        std::vector<Pair> pairs;
+        for (int i = 0; i < 12; ++i) {
+            Pair p; p.a = a; p.b = a + ms(1000.0 / 30.0);
+            p.plan = s.plan(p.a, p.b, 30.0);
+            pairs.push_back(p); a = p.b;
+        }
+        const int64_t base = pairs.back().plan.guard100ns;
+        check(base == ms(40.0) && s.guardBasePeriods() == 2,
+              "lookahead: 30 -> 50 starts from a two-period base");
+        check(s.guardExtraPeriods() == 0, "lookahead: no extra before a measurement asks for it");
+
+        s.setGuardExtraPeriods(1);
+        check(s.guardExtraPeriods() == 1, "lookahead: the engine can ask for one more period");
+        Pair next; next.a = a; next.b = a + ms(1000.0 / 30.0);
+        next.plan = s.plan(next.a, next.b, 30.0);
+        check(next.plan.guard100ns == base + ms(20.0),
+              "lookahead: one extra period reaches the next pair");
+        check(s.stats().lastGuardPeriods == 3, "lookahead: the log field reports base plus extra");
+        check(next.plan.realPts100ns > pairs.back().plan.realPts100ns,
+              "lookahead: raising it moves the output forward, never back");
+        bool onGrid = true;
+        for (unsigned i = 0; i < next.plan.count; ++i)
+            onGrid = onGrid && (next.plan.pts100ns[i] - next.plan.guard100ns - pairs.front().a) % ms(20.0) == 0;
+        check(onGrid, "lookahead: the extra periods keep every slot on the same lattice");
+
+        // The ceiling: a pathological measurement must not turn into a stalled
+        // output, so the extra is bounded well below the group width.
+        s.setGuardExtraPeriods(99);
+        check(s.guardExtraPeriods() == kFixedTargetMaxGuardPeriods - s.guardBasePeriods(),
+              "lookahead: the extra is clamped so the total stays under the ceiling");
+        Pair far; far.a = next.b; far.b = next.b + ms(1000.0 / 30.0);
+        far.plan = s.plan(far.a, far.b, 30.0);
+        check(far.plan.guard100ns == ms(20.0) * kFixedTargetMaxGuardPeriods,
+              "lookahead: at the ceiling the guard is a bounded whole number of periods");
+    }
+
+    // Lateness is the loop's only input: what the frames that really reached
+    // Present were late by, against their own slot.
+    {
+        AfgLateness l;
+        check(l.summary().samples == 0, "late: an empty window reports nothing");
+        for (int i = 0; i < 10; ++i) l.add(i < 8 ? 0.2 : 7.0);
+        const auto s = l.summary();
+        check(s.samples == 10, "late: every frame of the window is counted");
+        check(s.missed == 2, "late: only frames past the 1 ms threshold count as missed");
+        check(std::abs(s.p95 - 7.0) < 1e-9, "late: the p95 exposes a tail the mean hides");
+        check(std::abs(s.worst - 7.0) < 1e-9, "late: the worst case is kept");
+        // A window, not a session: a miss an hour ago must not hold the lookahead up.
+        l.reset();
+        for (unsigned i = 0; i < AfgLateness::Capacity + 20; ++i) l.add(i + 1 == AfgLateness::Capacity + 20 ? -5.0 : 1.0);
+        const auto ring = l.summary();
+        check(ring.samples == AfgLateness::Capacity, "late: the window stays bounded");
+        check(std::abs(ring.worst - 1.0) < 1e-9, "late: the oldest sample is the one evicted");
+    }
+
     // GPU load adaptation: the cap only ever lowers a pair's count, and what it
     // removes is reported separately from a configuration overflow.
     {

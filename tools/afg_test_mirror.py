@@ -63,6 +63,8 @@ class Plan:
 
 
 class Scheduler:
+    MAX_GUARD = 6          # kFixedTargetMaxGuardPeriods
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.anchored = False
@@ -74,12 +76,39 @@ class Scheduler:
         self.last_snap_ms = 0.0
         self.resyncs = 0
         self.guard_ticks = 0
+        self.guard_slots = 0
+        self.period_ticks = 2000000
+        self.requested_extra = 0
+        self.applied_extra = 0
+        self.last_guard_periods = 0
         self.load_cap = 0
         self.dropped_load = 0
         self.load_limited_pairs = 0
 
     def set_load_cap(self, cap):
         self.load_cap = cap
+
+    def refresh_guard(self):
+        if not self.anchored:
+            self.guard_ticks, self.applied_extra = 0, 0
+            return
+        periods = min(self.guard_slots + self.requested_extra, self.MAX_GUARD)
+        self.guard_ticks = periods * self.period_ticks
+        self.applied_extra = periods - self.guard_slots
+        self.last_guard_periods = periods
+
+    def set_guard_extra_periods(self, extra):
+        extra = min(extra, self.MAX_GUARD - 1)
+        if extra == self.requested_extra:
+            return
+        self.requested_extra = extra
+        self.refresh_guard()
+
+    def guard_extra_periods(self):
+        return self.applied_extra
+
+    def guard_base_periods(self):
+        return self.guard_slots
 
     def effective_max_runs(self):
         if not self.cfg.gpu_adapt or not self.load_cap:
@@ -114,7 +143,9 @@ class Scheduler:
             self.origin, self.last_slot, self.anchored = a, 0, True
             self.resyncs += 1
             slots = math.ceil((span / 10000.0) / (period / 10000.0) - 1e-9)
-            self.guard_ticks = int(round(min(max(slots, 1), 3) * period))
+            self.guard_slots = int(round(min(max(slots, 1), 3)))
+            self.period_ticks = int(round(period))
+            self.refresh_guard()
 
         def slot_time(index):
             return self.origin + int(round(index * period))
@@ -334,6 +365,78 @@ q, slow = run([40.0] * 20, content_fps=25.0)
 check(slow[1][2].guard == ms(40.0), "guard: 40 ms of input needs two periods too")
 l, fast = run([1000.0 / 30.0] * 20, cadence="latency")
 check(all(p.guard == 0 for _, _, p in fast), "guard: the latency policy adds none")
+
+# --- adaptive lookahead (engine control loop) -------------------------------
+s = Scheduler(Config(True, 50.0))
+a, pairs = ms(1000.0), []
+for _ in range(12):
+    b = a + ms(1000.0 / 30.0)
+    pairs.append((a, b, s.plan(a, b, 30.0)))
+    a = b
+base = pairs[-1][2].guard
+check(base == ms(40.0) and s.guard_base_periods() == 2,
+      f"lookahead: 30 -> 50 starts from a two-period base (base={s.guard_base_periods()}, guard={base})")
+check(s.guard_extra_periods() == 0, "lookahead: no extra before a measurement asks for it")
+s.set_guard_extra_periods(1)
+check(s.guard_extra_periods() == 1, "lookahead: one more period can be asked for")
+b = a + ms(1000.0 / 30.0)
+nxt = s.plan(a, b, 30.0)
+check(nxt.guard == base + ms(20.0), f"lookahead: the extra reaches the next pair (got {nxt.guard})")
+check(s.last_guard_periods == 3, "lookahead: the reported period count is base plus extra")
+check(nxt.real > pairs[-1][2].real, "lookahead: raising it only moves the output forward")
+check(all((nxt.pts[i] - nxt.guard - pairs[0][0]) % PERIOD == 0 for i in range(nxt.count)),
+      "lookahead: the extra keeps every slot on the same lattice")
+s.set_guard_extra_periods(99)
+check(s.guard_extra_periods() == Scheduler.MAX_GUARD - s.guard_base_periods(),
+      f"lookahead: the total is clamped to the ceiling (extra={s.guard_extra_periods()})")
+far = s.plan(b, b + ms(1000.0 / 30.0), 30.0)
+check(far.guard == ms(20.0) * Scheduler.MAX_GUARD,
+      f"lookahead: at the ceiling the guard is a bounded whole number of periods (got {far.guard})")
+
+# --- lateness window (the loop's only input) --------------------------------
+class Lateness:
+    CAPACITY = 128
+    LATE_MS = 1.0
+
+    def __init__(self):
+        self.samples = []
+
+    def reset(self):
+        self.samples = []
+
+    def add(self, v):
+        if not math.isfinite(v):
+            return
+        if len(self.samples) < self.CAPACITY:
+            self.samples.append(v)
+        else:
+            self.samples = self.samples[1:] + [v]
+
+    def summary(self):
+        n = len(self.samples)
+        if not n:
+            return dict(samples=0, missed=0, p50=0.0, p95=0.0, worst=0.0, mean=0.0)
+        s = sorted(self.samples)
+        at = lambda q: s[min(n - 1, int(q * (n - 1) + 0.5))]
+        return dict(samples=n, missed=sum(1 for v in s if v > self.LATE_MS),
+                    p50=at(0.50), p95=at(0.95), worst=s[-1], mean=sum(s) / n)
+
+
+lt = Lateness()
+check(lt.summary()["samples"] == 0, "late: an empty window reports nothing")
+for i in range(10):
+    lt.add(0.2 if i < 8 else 7.0)
+sm = lt.summary()
+check(sm["samples"] == 10, "late: every frame of the window is counted")
+check(sm["missed"] == 2, f"late: only frames past 1 ms count as missed (got {sm['missed']})")
+check(abs(sm["p95"] - 7.0) < 1e-9, f"late: the p95 exposes the tail (got {sm['p95']})")
+check(abs(sm["worst"] - 7.0) < 1e-9, "late: the worst case is kept")
+lt.reset()
+for i in range(Lateness.CAPACITY + 20):
+    lt.add(-5.0 if i + 1 == Lateness.CAPACITY + 20 else 1.0)
+rg = lt.summary()
+check(rg["samples"] == Lateness.CAPACITY, "late: the window stays bounded")
+check(abs(rg["worst"] - 1.0) < 1e-9, f"late: the oldest sample is the one evicted (got {rg['worst']})")
 
 # --- GPU load adaptation ----------------------------------------------------
 s, pairs = run([1000.0 / 30.0] * 30, target=100.0)

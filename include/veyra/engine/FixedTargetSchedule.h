@@ -3,6 +3,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 namespace veyra::engine {
 // Adaptive fixed-rate frame generation (AFG) for the NVIDIA VFG backend.
@@ -41,6 +42,10 @@ namespace veyra::engine {
 //  - Pure arithmetic on the source clock: no device work, no allocation, so it
 //    runs per pair on the engine thread.
 inline constexpr unsigned kFixedTargetMaxTicks=7;   // VFG's 8-wide group minus the real frame
+// The lookahead ceiling, in output periods. Six periods is 120 ms at 50 FPS: the
+// loop below only ever asks for what measured lateness demands, and this is the
+// bound that keeps a pathological measurement from turning into a stalled output.
+inline constexpr unsigned kFixedTargetMaxGuardPeriods=6;
 // 100 ns per second, the unit of every PTS in this project.
 inline constexpr int64_t kFixedTargetUnit=10000000;
 
@@ -173,6 +178,13 @@ struct FixedTargetPlan {
     //
     // Whole periods, so the output stays on the slot lattice. Applied only to the
     // fixed cadence: the latency policy deliberately keeps the source clock.
+    //
+    // The base is one input interval (that is what it takes for the second half
+    // of a pair to exist), and the engine adds measured periods on top
+    // (FixedTargetScheduler::setGuardExtraPeriods) until no output frame is
+    // presented late. A fixed base is not enough: on the 2026-11-26 720p30 run
+    // the base gave 26.7 ms of lead against a measured 24-30 ms graph time, so
+    // one batch in three still missed by ~7 ms.
     int64_t guard100ns=0;
     bool bypass=false;
     const char* reason="off";
@@ -200,6 +212,8 @@ public:
         double lastSnapMs=0;
         // The lookahead the fixed cadence adds to every frame (whole periods).
         double lastGuardMs=0;
+        // Base plus the measured extra, in periods; 1..6.
+        unsigned lastGuardPeriods=0;
         int64_t lastSlotIndex=0;
     };
 
@@ -210,13 +224,41 @@ public:
         config_=config;
     }
     const FixedTargetConfig& config()const{return config_;}
-    void reset(){const auto config=config_;*this=FixedTargetScheduler{};config_=config;}
+    void reset(){
+        // The measured extra survives a reset: a device or frame reset is exactly
+        // when the output would otherwise stall for the two seconds it takes the
+        // loop to climb back to a lookahead this hardware already needed.
+        const auto config=config_;const unsigned extra=requestedExtra_;
+        *this=FixedTargetScheduler{};config_=config;requestedExtra_=extra;
+    }
     // Measured load cap: the engine sets this from VFG's own per-frame GPU cost
     // (the Fg1 stage P95) once a second. 0 disables the artificial cap, and the
     // policy is off entirely when config().gpuLoadAdapt is false. It can only
     // lower the count the rate asked for - a target the GPU can meet is never
     // reduced by a measurement, only by a real cost that does not fit.
     void setLoadCap(unsigned cap){loadCap_=cap;}
+    // Extra lookahead periods on top of the one-interval base (0..3). The engine
+    // derives this from the measured lateness of the frames it actually
+    // presented, so the delay is the smallest one that measurement calls for
+    // instead of a constant picked for the worst case.
+    //
+    // A change takes effect on the next pair and shifts the whole output by that
+    // many periods: exactly one interval is long (increase) or short (decrease)
+    // at the transition, never accumulating. The engine moves this at most one
+    // period per control window, with a much slower decrease than increase.
+    void setGuardExtraPeriods(unsigned extra){
+        extra=std::min(extra,kFixedTargetMaxGuardPeriods-1u);
+        if(extra==requestedExtra_)return;
+        requestedExtra_=extra;
+        refreshGuard();
+    }
+    // The extra that is actually in force: the request minus whatever the ceiling
+    // left no room for, so the log and the panel never claim a period the grid is
+    // not really shifted by.
+    unsigned guardExtraPeriods()const{return appliedExtra_;}
+    // The lookahead one input interval costs on this grid, in periods: the part
+    // that is not adaptive.
+    unsigned guardBasePeriods()const{return guardSlots_;}
     // The ceiling plan() applies to a pair, before its own capacity check.
     unsigned effectiveMaxRuns()const{
         if(!config_.gpuLoadAdapt||!loadCap_)return config_.maxRuns;
@@ -266,7 +308,9 @@ public:
             // (Named slotSpan, not "slots": Qt defines that as an empty macro, and
             // this header is included from Qt translation units.)
             const double slotSpan=std::ceil(spanMs/(period/10000.0)-1e-9);
-            guardTicks_=static_cast<int64_t>(std::llround(std::clamp(slotSpan,1.0,3.0)*period));
+            guardSlots_=static_cast<unsigned>(std::llround(std::clamp(slotSpan,1.0,3.0)));
+            periodTicks_=static_cast<int64_t>(std::llround(period));
+            refreshGuard();
         }
         // The latency policy keeps the source clock, so it takes no lookahead (its
         // output is the union of two clocks by design).
@@ -347,6 +391,17 @@ public:
     const Stats& stats()const{return stats_;}
 
 private:
+    // Base periods + measured extra, in 100 ns. Called at the anchor and on every
+    // extra change; plan() only reads the result so the whole run of a pair uses
+    // one guard value.
+    void refreshGuard(){
+        if(!anchored_){guardTicks_=0;appliedExtra_=0;return;}
+        const unsigned periods=std::min(guardSlots_+requestedExtra_,kFixedTargetMaxGuardPeriods);
+        guardTicks_=int64_t(periods)*periodTicks_;
+        appliedExtra_=periods-guardSlots_;
+        stats_.lastGuardPeriods=periods;
+    }
+
     FixedTargetConfig config_{};
     Stats stats_{};
     bool anchored_=false;
@@ -354,6 +409,13 @@ private:
     long long lastSlot_=0;
     // Lookahead in 100 ns, set when the grid anchors (see FixedTargetPlan::guard100ns).
     int64_t guardTicks_=0;
+    // Base lookahead in periods (what one input interval costs on the grid) and one
+    // period in 100 ns, kept so a change of the extra can recompute guardTicks_
+    // without waiting for the next anchor.
+    unsigned guardSlots_=0;
+    int64_t periodTicks_=2000000;
+    unsigned requestedExtra_=0;
+    unsigned appliedExtra_=0;
     unsigned loadCap_=0;
 };
 
@@ -417,5 +479,52 @@ private:
     std::array<uint8_t,Capacity> off_{};
     unsigned count_=0,head_=0;
     int64_t last_=0;
+};
+
+// How late each output frame reached Present, measured against its own slot.
+// This is what the lookahead loop is driven by, and deliberately not a model of
+// the pipeline: it measures the symptom (a frame that missed its slot, and by
+// how much) so it keeps working when the GPU, the driver, the source rate or the
+// scene changes underneath it. Positive = late; a frame presented early (which
+// the slot wait prevents anyway) is recorded as its negative value and ignored
+// by the p95 the loop reads.
+class AfgLateness {
+public:
+    static constexpr unsigned Capacity=128;
+    // One control window's worth of frames at 50 FPS, so the summary follows a
+    // change inside a second or two rather than averaging it away.
+    static constexpr double kLateMs=1.0;
+    struct Summary {
+        unsigned samples=0,missed=0;
+        double p50=0,p95=0,worst=0,mean=0;
+    };
+    void reset(){count_=0;}
+    void add(double ms){
+        if(!std::isfinite(ms))return;
+        if(count_<Capacity)samples_[count_++]=ms;
+        else{
+            std::memmove(samples_.data(),samples_.data()+1,sizeof(double)*(Capacity-1));
+            samples_[Capacity-1]=ms;
+        }
+    }
+    Summary summary()const{
+        Summary out;
+        out.samples=count_;
+        if(!count_)return out;
+        std::array<double,Capacity> sorted{};
+        double sum=0;
+        for(unsigned i=0;i<count_;++i){
+            sorted[i]=samples_[i];sum+=samples_[i];
+            if(samples_[i]>kLateMs)++out.missed;
+        }
+        std::sort(sorted.begin(),sorted.begin()+count_);
+        const auto at=[&](double q){return sorted[std::min(count_-1,unsigned(q*double(count_-1)+0.5))];};
+        out.p50=at(0.50);out.p95=at(0.95);out.worst=sorted[count_-1];
+        out.mean=sum/double(count_);
+        return out;
+    }
+private:
+    std::array<double,Capacity> samples_{};
+    unsigned count_=0;
 };
 }

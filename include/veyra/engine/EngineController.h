@@ -91,6 +91,15 @@ struct AfgStatus {
     // Lookahead added to every frame, in ms: the price of putting generated frames
     // on a grid at all, since one of them cannot exist before its second real frame.
     double guardMs=0;
+    // The same lookahead in output periods, and how much of it is the adaptive
+    // part. Base is what one input interval costs on the grid; extra is the
+    // measured correction (see the loop in EngineController).
+    unsigned guardPeriods=0,guardExtra=0;
+    // How late the last control window's frames reached Present against their own
+    // slot: the quantity the lookahead loop regulates, and the direct evidence for
+    // "the output really is even" that a mean interval cannot give.
+    double lateGenP95Ms=0,lateRealP95Ms=0;
+    uint64_t guardChanges=0;
     uint64_t generated=0,droppedCap=0,droppedNear=0,droppedLoad=0,resyncs=0;
     uint64_t bypassLong=0,bypassAtTarget=0,bypassOff=0;
     // Interval between our own successful presents (AfgOutputPace). This is the

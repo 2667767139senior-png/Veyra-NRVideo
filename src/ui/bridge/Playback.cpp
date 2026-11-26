@@ -158,7 +158,13 @@ QString QmlPlayerBridge::afgStatusText() const {
                      .arg(a.p50Ms, 0, 'f', 2).arg(a.p95Ms, 0, 'f', 2).arg(a.p99Ms, 0, 'f', 2)
                      .arg(a.offCadence).arg(a.paceSamples);
     if (!a.latencyCadence && a.guardMs > 0.0)
-        lines << tr("前瞻 %1 ms（%2 个输出周期）：生成帧要等第二个真实帧才能存在，这段延迟买的是均匀间隔").arg(a.guardMs, 0, 'f', 1).arg(a.periodMs > 0.0 ? int(a.guardMs / a.periodMs + 0.5) : 0);
+        lines << tr("前瞻 %1 ms（%2 个输出周期，其中自适应 %3）：生成帧要等第二个真实帧才能存在，这段延迟买的是均匀间隔")
+                     .arg(a.guardMs, 0, 'f', 1)
+                     .arg(a.guardPeriods ? a.guardPeriods : unsigned(a.periodMs > 0.0 ? a.guardMs / a.periodMs + 0.5 : 0.0))
+                     .arg(a.guardExtra);
+    if (a.lateGenP95Ms > 0.0 || a.lateRealP95Ms > 0.0)
+        lines << tr("晚到 P95 生成 %1 · 真实 %2 ms（相对各自的槽位；持续 >1 ms 说明这一路在漏槽）")
+                     .arg(a.lateGenP95Ms, 0, 'f', 2).arg(a.lateRealP95Ms, 0, 'f', 2);
     lines << tr("丢槽 上限 %1 · 过近 %2 · GPU %3 · 重锚定 %4")
                  .arg(a.droppedCap).arg(a.droppedNear).arg(a.droppedLoad).arg(a.resyncs);
     if (a.fgGpuP95Ms > 0.05)
