@@ -194,15 +194,18 @@ int wmain(int argc, wchar_t** argv) {
 
     // 2) Timestep mode: one run per requested position, same pair, no multiplier
     //    write between them. This is exactly what the AFG scheduler does.
-    const std::array<double, 6> steps{0.1, 0.2, 0.35, 0.5, 0.65, 0.8};
+    // Seven positions: the 8-wide pool is what fixedTargetCapacity sizes for a
+    // 160 FPS target, so the probe must exercise the whole range AFG can ask for.
+    const unsigned probeGroup = 8;
+    const std::array<double, 7> steps{0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9};
     std::printf("timestep mode:");
     bool timestepOk = true;
     std::vector<double> centers;
     unsigned index = 0;
     for (double t : steps) {
         ++index;
-        if (index >= multiplier) break;  // only M-1 output buffers exist
-        if (!vfg.generate(1, index, multiplier, false, false, t)) {
+        if (index >= probeGroup) break;  // only M-1 output buffers exist
+        if (!vfg.generate(1, index, probeGroup, false, false, t)) {
             std::printf(" FAIL generate(t=%.2f)\n", t);
             timestepOk = false;
             break;

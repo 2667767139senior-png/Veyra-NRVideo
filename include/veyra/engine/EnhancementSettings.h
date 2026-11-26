@@ -559,8 +559,8 @@ struct EnhancementSettings {
     // a free-running 1/targetFps grid instead of i/M inside every pair, so a 30 FPS
     // picture that dips to 25 FPS keeps its output cadence. Disabled keeps multiplier
     // mode exactly as it is. Only the mode and the run cap shape the graph (they size
-    // the generated slot pool); the rate and the smoothing/clamp knobs are read per
-    // pair, so the comparisons below let them change without a rebuild.
+    // the generated slot pool); the rate and the cadence policy are read per pair,
+    // so the comparisons below let them change without a rebuild.
     FixedTargetConfig fgFixedTarget{};
     // The mode only exists for live VFG. A saved profile can carry the flag while
     // the backend was something else, and that must not size a generated pool.
@@ -639,9 +639,11 @@ struct EnhancementSettings {
             active.frameGenerationBackend=defaults.frameGenerationBackend;active.vfgQuality=defaults.vfgQuality;
             active.fgMotion=defaults.fgMotion;active.fgStrictAdmission=defaults.fgStrictAdmission;
         }else if(frameGenerationBackend!=FrameGenerationBackend::Vfg)active.vfgQuality=defaults.vfgQuality;
-        // Fixed target is a VFG capability; without frame generation it has nothing
-        // to schedule, and toggling it must not invalidate an unrelated graph.
-        if(multiplier<=1||frameGenerationBackend!=FrameGenerationBackend::Vfg)active.fgFixedTarget=defaults.fgFixedTarget;
+        // Fixed target is a VFG capability, nothing else. It used to be cleared as
+        // well whenever the stored multiplier was 1, which silently turned an
+        // enabled mode into "multiplier mode with generation off" - the panel hides
+        // that control, so the user had no way to see or undo it.
+        if(frameGenerationBackend!=FrameGenerationBackend::Vfg)active.fgFixedTarget=defaults.fgFixedTarget;
         if(!color.enabled)active.color=defaults.color;
         for(size_t i=0;i<active.additionalColors.size();++i)
             if(i>=additionalColorCount||!additionalColors[i].enabled)active.additionalColors[i]={};
@@ -711,7 +713,7 @@ struct EnhancementSettings {
         // Adaptive multiplier and pacing repair: chosen per pair inside the running graph.
         video.fgAdaptive=target.fgAdaptive;
         video.pacingRepair=target.pacingRepair;
-        // Fixed target: the rate and the smoothing knobs are per-pair values too. The
+        // Fixed target: the rate and the cadence policy are per-pair values too. The
         // mode and the run cap decide how many generated slots exist, so they stay.
         if(fixedTargetSameStructure(video.fgFixedTarget,target.fgFixedTarget))video.fgFixedTarget=target.fgFixedTarget;
         // Half-rate variants use the same graph and differ only at sample admission.

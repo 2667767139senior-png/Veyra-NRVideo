@@ -488,9 +488,9 @@ class QmlPlayerBridge : public QObject {
     // graph, while the rate and the smoothing knobs are read per pair.
     Q_PROPERTY(bool fgFixedTarget READ fgFixedTarget WRITE setFgFixedTarget NOTIFY settingsChanged)
     Q_PROPERTY(int fgFixedTargetFps READ fgFixedTargetFps WRITE setFgFixedTargetFps NOTIFY settingsChanged)
-    Q_PROPERTY(double fgFixedTargetSmoothing READ fgFixedTargetSmoothing WRITE setFgFixedTargetSmoothing NOTIFY settingsChanged)
-    Q_PROPERTY(int fgFixedTargetClampMinMs READ fgFixedTargetClampMinMs WRITE setFgFixedTargetClampMinMs NOTIFY settingsChanged)
-    Q_PROPERTY(int fgFixedTargetClampMaxMs READ fgFixedTargetClampMaxMs WRITE setFgFixedTargetClampMaxMs NOTIFY settingsChanged)
+    // 0 = fixed cadence (real frames snapped onto the output grid), 1 = latency
+    // (real frames keep their own timestamps, only the gaps are filled).
+    Q_PROPERTY(int fgFixedTargetCadence READ fgFixedTargetCadence WRITE setFgFixedTargetCadence NOTIFY settingsChanged)
     // True when the fixed-target mode can actually run (VFG backend). The mode row
     // stays visible either way and explains itself when this is false.
     Q_PROPERTY(bool fgFixedTargetAvailable READ fgFixedTargetAvailable NOTIFY settingsChanged)
@@ -1211,12 +1211,8 @@ public:
     void setFgFixedTarget(bool value);
     int fgFixedTargetFps() const;
     void setFgFixedTargetFps(int value);
-    double fgFixedTargetSmoothing() const;
-    void setFgFixedTargetSmoothing(double value);
-    int fgFixedTargetClampMinMs() const;
-    void setFgFixedTargetClampMinMs(int value);
-    int fgFixedTargetClampMaxMs() const;
-    void setFgFixedTargetClampMaxMs(int value);
+    int fgFixedTargetCadence() const;
+    void setFgFixedTargetCadence(int value);
     bool fgFixedTargetAvailable() const;
     bool dynamicHud() const;
     void setDynamicHud(bool value);

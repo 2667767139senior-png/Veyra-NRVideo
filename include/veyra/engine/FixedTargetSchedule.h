@@ -5,67 +5,68 @@
 #include <cstdint>
 
 namespace veyra::engine {
-// Fixed-target frame generation ("固定目标帧率") for the NVIDIA VFG backend.
-// See docs/FIXED_TARGET_FG_2026-11-25.md.
+// Adaptive fixed-rate frame generation (AFG) for the NVIDIA VFG backend.
+// See docs/AFG_2026-11-26.md.
 //
 // Multiplier mode spends a constant M-1 runs on every source interval, so the
 // output rate follows the picture: 30 FPS content that dips to 25 FPS drags a
 // 60 FPS output down to 50, and that cadence change is what the eye reads as a
-// stutter. Fixed-target mode instead decides the number of generated frames PER
-// INTERVAL from the interval itself - the way adaptive frame generation does:
+// stutter.
 //
-//     want  = spanMs * targetFps / 1000 + carry
-//     count = clamp(round(want) - 1, 0, maxRuns)     // B itself is the last frame
-//     carry = want - (count + 1)                     // error handed to the next pair
+// AFG instead owns an OUTPUT CLOCK, independent of when input arrives:
 //
-// A 40 ms pair at 80 FPS asks for 3.2 frames, so it gets two generated frames
-// (VFG multiplier 3) and 0.2 frames of credit; the next asks 3.4, then 3.6, so
-// the multiplier walks 3,3,4,3,3,... and the average output rate is exactly the
-// target. A 33 ms pair at the same target asks 2.67 and walks 3,2,3,2. That is
-// what absorbs the 25/30 FPS wobble: a longer interval gets one more generated
-// frame, and nothing else changes.
+//     slot(n) = origin + round(n * 1000/targetFps)        [source-clock 100 ns]
 //
-// What this deliberately does NOT do:
-//  - It does not run the output on its own grid. An earlier version planned a
-//    free-running 1/targetFps grid and snapped the real frame onto it, which
-//    re-times the picture (up to one period of extra latency) and makes the
-//    output clock something the engine has to keep in sync. Here the real frame
-//    keeps its own timestamp and its own latency; only the count varies.
-//  - It does not use VFG's explicit-timestep mode. The generated frames sit at
-//    t = i/(count+1) for i = 1..count, which is exactly what
-//    FrameMultiplier=count+1 with FrameIndex=i produces - the same path
-//    multiplier mode has always used, so nothing new rides on the SDK.
-//  - It does not let an unschedulable pair build latency: when count hits
-//    maxRuns the leftover credit is dropped (stats.droppedByCap), never owed.
+// Every slot is one output frame. The real frames are assigned to slots too
+// ("snapped up": a real frame takes the first slot at or after its own
+// timestamp, so it is never shown early), and every slot strictly between two
+// real frames is filled by a VFG run at
 //
-// Everything here is pure arithmetic on the source clock in 100 ns units: no
-// device work, no allocation, so it can run per pair on the engine thread.
-inline constexpr unsigned kFixedTargetMaxTicks=6;
+//     t = (slot - a) / (b - a)
+//
+// This is what makes the output cadence uniform rather than merely
+// average-correct: at 30 FPS in and 50 FPS out the grid asks for
+// 20/33.3 = 0.6, then 0.2 and 0.8, then 0.4 - positions no integer multiplier
+// can express, which is why this mode needs VFG's explicit-timestep selector
+// (FrameMultiplier=0 plus Timestep) and why the earlier count-only version
+// could only alternate 16.7/33.3 ms.
+//
+// Properties this is built to keep:
+//  - Bounded latency: snapping up delays a real frame by at most one period
+//    (20 ms at 50 FPS). Cadence::Latency turns snapping off for the cost of an
+//    uneven union of grid slots and real timestamps.
+//  - No debt: a stall, a long interval or a lost slot is dropped, never repaid,
+//    so the queue cannot grow after a hiccup.
+//  - No drift: slot times are computed from the origin, never accumulated.
+//  - Pure arithmetic on the source clock: no device work, no allocation, so it
+//    runs per pair on the engine thread.
+inline constexpr unsigned kFixedTargetMaxTicks=7;   // VFG's 8-wide group minus the real frame
 // 100 ns per second, the unit of every PTS in this project.
 inline constexpr int64_t kFixedTargetUnit=10000000;
 
+// How the real frames meet the output grid.
+enum class FixedTargetCadence : unsigned {
+    // Real frames are moved onto the grid (never earlier). Uniform output,
+    // at most one period of added latency. The product default.
+    Fixed=0,
+    // Real frames keep their own timestamps; only the gaps are filled. Zero
+    // added latency, but the output is the union of two clocks and is therefore
+    // not perfectly even. Kept for latency-critical use.
+    Latency=1,
+};
+
 struct FixedTargetConfig {
     bool enabled=false;
-    // 50 FPS is the default because it is the one target that exercises both
-    // halves of the arithmetic on the content this mode was written for: a 33 ms
-    // pair at 50 asks for 1.67 frames, so the count walks 1,0,1,1,0,1 instead of
-    // sitting on a fixed group width. A target of 80 or more never asks for zero
-    // frames on such a source, which hides the "generate nothing this pair" path.
+    // 50 FPS: the target this mode was written for (25-30 FPS content from a
+    // capture card). Any 1-480 value is accepted; the panel edits 0-160.
     double targetFps=50.0;
-    // Interval smoothing strength, 0..1, 0 = off (the default). With 0 the exact
-    // source span decides the count, so the generated frames sit at their true
-    // temporal positions. Smoothing averages the span a little for content whose
-    // frame time keeps flipping, at the cost of the count lagging a real change
-    // by a pair or two.
-    double smoothing=0.0;
-    double clampMinMs=25.0;
-    double clampMaxMs=60.0;
-    // A pair longer than this is a stall, a load or a pause: no interpolation,
-    // the real frame goes out as it came in and the credit is forgotten.
+    FixedTargetCadence cadence=FixedTargetCadence::Fixed;
+    // A pair longer than this is a stall, a load or a pause: no interpolation
+    // across it, and the grid re-anchors on the next real frame.
     double maxIntervalMs=100.0;
-    // Generated frames per pair. Past this the extra frames are dropped rather
+    // Generated frames per pair. Past this the extra slots are dropped rather
     // than generated: a GPU that cannot keep up must lose frames, not latency.
-    unsigned maxRuns=4;
+    unsigned maxRuns=2;
 
     bool operator==(const FixedTargetConfig&)const=default;
 };
@@ -76,16 +77,14 @@ inline bool fixedTargetValid(const FixedTargetConfig& c){
     // panel offers the type-in field 0-160, and a target that low can only be
     // read as a request to stop inserting rather than as an error.
     return std::isfinite(c.targetFps)&&c.targetFps>=0.0&&c.targetFps<=480.0&&
-        std::isfinite(c.smoothing)&&c.smoothing>=0.0&&c.smoothing<=1.0&&
-        std::isfinite(c.clampMinMs)&&std::isfinite(c.clampMaxMs)&&c.clampMinMs>0.0&&c.clampMaxMs>=c.clampMinMs&&
-        std::isfinite(c.maxIntervalMs)&&c.maxIntervalMs>=c.clampMaxMs&&
+        std::isfinite(c.maxIntervalMs)&&c.maxIntervalMs>=20.0&&c.maxIntervalMs<=1000.0&&
         c.maxRuns>=1&&c.maxRuns<=kFixedTargetMaxTicks;
 }
 
 // Frames per pair a target rate needs at the slowest content this mode is meant
 // for (25 FPS = 40 ms): 40 ms at 120 FPS is 4.8 frames, so a cap of four would
 // drop one in every interval. 50 FPS comes out at two (40 ms x 50 = 2.0 frames),
-// 80 at four, and 160 at seven - capped by kFixedTargetMaxTicks. Callers keep
+// 80 at four, 160 at seven - capped by kFixedTargetMaxTicks. Callers keep
 // maxRuns in step with the target instead of hard-coding it, so typing 144 FPS
 // does not silently arrive capped at 4.
 inline unsigned fixedTargetRunsFor(double targetFps){
@@ -114,100 +113,143 @@ inline unsigned fixedTargetCapacity(const FixedTargetConfig& c,unsigned requeste
 
 struct FixedTargetPlan {
     static constexpr unsigned Capacity=kFixedTargetMaxTicks;
-    // Generated frames for this pair. The group VFG runs with is count+1 wide,
-    // because the real frame is its last member.
+    // Generated frames for this pair, in presentation order.
     unsigned count=0;
-    // count+1, i.e. the real group width. 1 means "this pair generates nothing":
-    // the 50 FPS target on a 30 FPS source lands here on every other pair, and a
-    // floor of 2 used to make the telemetry claim a group the graph never ran.
+    // count+1, i.e. the VFG group width this pair asks for. 1 means "this pair
+    // generates nothing", which the graph turns into zero VFG runs.
     unsigned outputMultiplier=1;
-    std::array<double,Capacity> t{};             // i/(count+1); telemetry only
+    // Presentation time of each generated frame, already on the output grid.
+    std::array<int64_t,Capacity> pts100ns{};
+    // VFG Timestep for the same frame: (pts - a) / (b - a), strictly inside (0,1).
+    std::array<double,Capacity> timestep{};
+    // Presentation time to use for the real frame (0 = keep its own timestamp).
+    // Slots are snapped up, so this is at or after b.
+    int64_t realPts100ns=0;
     bool bypass=false;
     const char* reason="off";
+    // Slots this pair wanted but did not get, for the log: past the per-pair cap,
+    // or too close to an endpoint for a meaningful interpolation.
+    unsigned droppedCap=0,droppedNear=0;
+    bool operator==(const FixedTargetPlan&)const=default;
 };
 
 // Runs on the engine thread, once per accepted pair, in source-clock order.
 class FixedTargetScheduler {
 public:
     struct Stats {
-        uint64_t intervals=0,ticks=0,droppedByCap=0;
+        uint64_t intervals=0,generated=0,droppedCap=0,droppedNear=0,resyncs=0;
         uint64_t bypassLong=0,bypassAtTarget=0,bypassInvalid=0,bypassOff=0;
-        unsigned lastTicks=0;
-        double lastSpanMs=0,lastSmoothedSpanMs=0,lastCarry=0;
+        unsigned lastGenerated=0;
+        double lastSpanMs=0,lastPeriodMs=20.0;
+        // How far the real frame was pushed onto the grid. This IS the latency
+        // the cadence policy adds, in milliseconds.
+        double lastSnapMs=0;
+        int64_t lastSlotIndex=0;
     };
 
     void configure(const FixedTargetConfig& config){
-        // Only the mode and the cap are structural; a rate change is per pair and
-        // must not disturb the credit, or every slider drag would restart the
-        // average.
-        if(!config.enabled&&config_.enabled)carry_=0;
+        // A rate change keeps the grid: re-anchoring on every slider drag would
+        // restart the slot numbering mid-play. A disable does clear it.
+        if(!config.enabled)anchored_=false;
         config_=config;
-        if(!config.enabled)smoothedSpan_=0;
     }
     const FixedTargetConfig& config()const{return config_;}
     void reset(){const auto config=config_;*this=FixedTargetScheduler{};config_=config;}
 
+    // a100ns/b100ns: the previous and current real frame timestamps.
+    // measuredContentFps: the engine's smoothed input rate, used only to recognise
+    // a source that already runs at or above the target.
     FixedTargetPlan plan(int64_t a100ns,int64_t b100ns,double measuredContentFps){
         FixedTargetPlan out;
         if(!config_.enabled){out.reason="off";return out;}
         // A zero target is the panel's "insert nothing" value; catching it here
-        // keeps the conversion to a frame count out of a degenerate range.
+        // keeps the conversion to a period out of a degenerate range.
         if(!(config_.targetFps>0.0)){
-            ++stats_.bypassOff;out.bypass=true;out.reason="targetOff";carry_=0;return out;
+            ++stats_.bypassOff;out.bypass=true;out.reason="targetOff";anchored_=false;return out;
         }
         const int64_t span=b100ns-a100ns;
         if(span<=0){
-            ++stats_.bypassInvalid;out.bypass=true;out.reason="interval";carry_=0;return out;
+            ++stats_.bypassInvalid;out.bypass=true;out.reason="interval";anchored_=false;return out;
         }
-        ++stats_.intervals;
         const double spanMs=double(span)/10000.0;
         stats_.lastSpanMs=spanMs;
         if(spanMs>config_.maxIntervalMs){
             // Stall, load or pause. Never interpolate across it, and do not pay the
-            // missed frames back afterwards: the credit is a rounding remainder,
-            // not a debt.
+            // missed slots back afterwards: the grid re-anchors on the next frame.
             ++stats_.bypassLong;out.bypass=true;out.reason="longInterval";
-            carry_=0;smoothedSpan_=0;
-            return out;
+            anchored_=false;return out;
         }
         // The picture already arrives at or above the target (menus, a real 60 FPS
         // source, a target below the source): nothing to insert, and a run would
         // only spend GPU on a frame that is a copy of B.
         if(std::isfinite(measuredContentFps)&&measuredContentFps>=config_.targetFps*0.98){
             ++stats_.bypassAtTarget;out.bypass=true;out.reason="sourceAtTarget";
-            carry_=0;smoothedSpan_=0;
-            return out;
+            anchored_=false;return out;
         }
-        double usedSpanMs=spanMs;
-        if(config_.smoothing>0.0){
-            const double low=std::min(config_.clampMinMs,config_.clampMaxMs),high=std::max(config_.clampMinMs,config_.clampMaxMs);
-            const double clamped=std::clamp(spanMs,low,high);
-            if(smoothedSpan_<=0.0)smoothedSpan_=clamped;
-            else smoothedSpan_+=(clamped-smoothedSpan_)*std::clamp(config_.smoothing,0.0,1.0);
-            usedSpanMs=smoothedSpan_;
+        const double period=double(kFixedTargetUnit)/config_.targetFps;
+        if(!anchored_){
+            // The first real frame of a run owns slot 0: the output clock starts
+            // where the picture does, so no slot is ever in the past.
+            origin_=a100ns;lastSlot_=0;anchored_=true;++stats_.resyncs;
         }
-        stats_.lastSmoothedSpanMs=usedSpanMs;
-        const double want=usedSpanMs*config_.targetFps/1000.0+carry_;
-        long long count=std::llround(want)-1;
-        if(count<0)count=0;
-        if(count>static_cast<long long>(config_.maxRuns)){
-            stats_.droppedByCap+=uint64_t(count)-config_.maxRuns;
-            count=config_.maxRuns;
-            carry_=0;                                  // lost frames, not owed frames
-        }else{
-            // The remainder is bounded to one frame of credit either way: a single
-            // mis-measured interval must not swing the next group by more than one.
-            carry_=std::clamp(want-double(count+1),-1.0,1.0);
+        const auto slotTime=[&](long long index){
+            return origin_+static_cast<int64_t>(std::llround(double(index)*period));
+        };
+        // First slot at or after b: the real frame is never shown early.
+        // The epsilon matters: when b lands exactly on a slot (it does every few
+        // pairs whenever 1000/targetFps is not a whole 100 ns count) the division
+        // can come out as 18.000000000000004 and ceil would hand this pair an
+        // empty plan plus a real frame one slot late - a 40 ms hole at 50 FPS.
+        long long slotB=static_cast<long long>(std::ceil(double(b100ns-origin_)/period-1e-6));
+        // Never behind the previous real frame: two inputs faster than the target
+        // would otherwise claim the same slot and the batch would go backwards.
+        if(slotB<=lastSlot_)slotB=lastSlot_+1;
+        // Guard against a degenerate origin (b before the anchor after a bad
+        // timestamp): snap forward instead of planning negative work.
+        if(slotB<1)slotB=1;
+
+        // Only a degenerate position is refused. A 2% guard was tried first and
+        // cost 2% of the slots on a 29.97 -> 50 grid (a slot lands 0.2 ms from A
+        // every few pairs), which is a hole in the cadence - the one thing this
+        // mode exists to prevent. A frame 0.2 ms from A is a repeat, not a hole.
+        constexpr double minT=0.005;
+        std::array<int64_t,Capacity> pts{};
+        std::array<double,Capacity> steps{};
+        unsigned found=0;
+        for(long long index=lastSlot_+1;index<slotB;++index){
+            const int64_t at=slotTime(index);
+            double t=double(at-a100ns)/double(span);
+            // A slot exactly on an endpoint has nothing to interpolate. Anything
+            // else is clamped into the selector's open range rather than dropped:
+            // a 0.2 ms error in position is invisible, a hole in the cadence is
+            // not. (At 160 FPS this fires on about 1% of slots.)
+            if(t<=0.0||t>=1.0){++out.droppedNear;++stats_.droppedNear;continue;}
+            t=std::clamp(t,minT,1.0-minT);
+            if(found==Capacity){++out.droppedCap;++stats_.droppedCap;continue;}
+            pts[found]=at;steps[found]=t;++found;
         }
-        out.count=unsigned(count);
-        // Group width, not a clamped multiplier: 1 is a legitimate answer that
-        // means "no Run for this pair", and the graph turns it into fgCalls=0.
-        out.outputMultiplier=out.count+1u;
-        for(unsigned i=0;i<out.count;++i)out.t[i]=double(i+1)/double(out.outputMultiplier);
-        out.reason=out.count?"adaptive":"none";
-        stats_.lastTicks=out.count;
-        stats_.lastCarry=carry_;
-        stats_.ticks+=out.count;
+        unsigned first=0;
+        if(found>config_.maxRuns){
+            // Keep the newest slots: they are the ones still worth presenting, and
+            // dropping the oldest leaves one hole instead of a growing backlog.
+            out.droppedCap+=found-config_.maxRuns;
+            stats_.droppedCap+=found-config_.maxRuns;
+            first=found-config_.maxRuns;found=config_.maxRuns;
+        }
+        out.count=found;
+        for(unsigned i=0;i<found;++i){out.pts100ns[i]=pts[first+i];out.timestep[i]=steps[first+i];}
+        out.outputMultiplier=found+1u;
+        if(config_.cadence==FixedTargetCadence::Fixed){
+            out.realPts100ns=slotTime(slotB);
+            stats_.lastSnapMs=double(out.realPts100ns-b100ns)/10000.0;
+        }else stats_.lastSnapMs=0.0;
+        lastSlot_=slotB;
+        out.reason=found?"grid":"none";
+        stats_.lastGenerated=found;
+        stats_.lastPeriodMs=period/10000.0;
+        stats_.lastSlotIndex=slotB;
+        stats_.generated+=found;
+        ++stats_.intervals;
         return out;
     }
 
@@ -216,7 +258,57 @@ public:
 private:
     FixedTargetConfig config_{};
     Stats stats_{};
-    double carry_=0;           // fractional output frame owed to the next pair
-    double smoothedSpan_=0;
+    bool anchored_=false;
+    int64_t origin_=0;
+    long long lastSlot_=0;
+};
+
+// Measures what actually left the presenter, which is the only number that
+// answers "is the output even": the interval between consecutive Present calls.
+// A correct average with a bad tail is exactly the failure this project must not
+// report as success, so the percentiles are recorded next to it.
+class AfgOutputPace {
+public:
+    static constexpr unsigned Capacity=256;
+    struct Summary {
+        unsigned samples=0;
+        double p50=0,p95=0,p99=0,mean=0,stddev=0;
+        // Intervals that were not one period: a late frame, a dropped slot or a
+        // stall. Counted against the target period, with a 10% tolerance.
+        unsigned offCadence=0;
+    };
+    void reset(){count_=0;head_=0;last_=0;offCadence_=0;}
+    void record(int64_t now,double periodMs){
+        if(last_>0&&now>last_){
+            const double interval=double(now-last_)/10000.0;
+            if(interval>0.0&&interval<1000.0){
+                if(count_<Capacity)samples_[(head_+count_)%Capacity]=interval,++count_;
+                else{samples_[head_]=interval;head_=(head_+1)%Capacity;}
+                if(periodMs>0.0&&std::abs(interval-periodMs)>periodMs*0.1)++offCadence_;
+            }
+        }
+        last_=now;
+    }
+    Summary summary()const{
+        Summary out;
+        out.samples=count_;
+        out.offCadence=offCadence_;
+        if(!count_)return out;
+        std::array<double,Capacity> sorted{};
+        double sum=0;
+        for(unsigned i=0;i<count_;++i){const double v=samples_[(head_+i)%Capacity];sorted[i]=v;sum+=v;}
+        std::sort(sorted.begin(),sorted.begin()+count_);
+        const auto at=[&](double q){return sorted[std::min(count_-1,unsigned(q*double(count_-1)+0.5))];};
+        out.p50=at(0.50);out.p95=at(0.95);out.p99=at(0.99);
+        out.mean=sum/double(count_);
+        double var=0;
+        for(unsigned i=0;i<count_;++i){const double d=sorted[i]-out.mean;var+=d*d;}
+        out.stddev=std::sqrt(var/double(count_));
+        return out;
+    }
+private:
+    std::array<double,Capacity> samples_{};
+    unsigned count_=0,head_=0,offCadence_=0;
+    int64_t last_=0;
 };
 }

@@ -322,10 +322,9 @@ engine::FixedTargetConfig normalizedFixedTarget(engine::FixedTargetConfig c) {
     // The cap has to follow the rate the user typed, or 120 FPS and above would
     // arrive capped at four ticks per interval and show up as dropped frames.
     c.maxRuns = engine::fixedTargetRunsFor(c.targetFps);
-    c.smoothing = std::clamp(std::isfinite(c.smoothing) ? c.smoothing : 0.0, 0.0, 1.0);
-    c.clampMinMs = std::clamp(std::isfinite(c.clampMinMs) ? c.clampMinMs : 25.0, 4.0, 200.0);
-    c.clampMaxMs = std::clamp(std::isfinite(c.clampMaxMs) ? c.clampMaxMs : 60.0, c.clampMinMs, 400.0);
-    c.maxIntervalMs = std::clamp(std::isfinite(c.maxIntervalMs) ? c.maxIntervalMs : 100.0, c.clampMaxMs, 1000.0);
+    if (c.cadence != engine::FixedTargetCadence::Latency) c.cadence = engine::FixedTargetCadence::Fixed;
+    c.maxIntervalMs = std::clamp(std::isfinite(c.maxIntervalMs) ? c.maxIntervalMs : 100.0, 20.0, 1000.0);
+    if (!engine::fixedTargetValid(c)) c.maxIntervalMs = 100.0;
     return c;
 }
 }
@@ -357,10 +356,8 @@ bool QmlPlayerBridge::fgFixedTargetAvailable() const {
     return settings().frameGenerationBackend == engine::FrameGenerationBackend::Vfg;
 }
 int QmlPlayerBridge::fgFixedTargetFps() const { return int(std::lround(settings().fgFixedTarget.targetFps)); }
-double QmlPlayerBridge::fgFixedTargetSmoothing() const { return settings().fgFixedTarget.smoothing; }
-int QmlPlayerBridge::fgFixedTargetClampMinMs() const { return int(std::lround(settings().fgFixedTarget.clampMinMs)); }
-int QmlPlayerBridge::fgFixedTargetClampMaxMs() const { return int(std::lround(settings().fgFixedTarget.clampMaxMs)); }
-// The four knobs below only feed the per-pair plan: no rebuild, and a rejected
+int QmlPlayerBridge::fgFixedTargetCadence() const { return int(settings().fgFixedTarget.cadence); }
+// Rate and cadence only feed the per-pair plan: no rebuild, and a rejected
 // commit restores the panel because settingsChanged re-reads the applied values.
 void QmlPlayerBridge::commitFixedTarget(engine::FixedTargetConfig next, const char* what) {
     auto s = settings();
@@ -384,15 +381,13 @@ void QmlPlayerBridge::commitFixedTarget(engine::FixedTargetConfig next, const ch
     veyra::log::info("ui-fixed-target", "what=" + std::string(what) + " mode=" + (next.enabled ? "on" : "off") +
         " targetFps=" + std::to_string(int(std::lround(next.targetFps))) +
         " maxRuns=" + std::to_string(next.maxRuns) +
-        " smoothing=" + std::to_string(next.smoothing) +
+        " cadence=" + std::string(next.cadence == engine::FixedTargetCadence::Latency ? "latency" : "fixed") +
         " multiplier=" + std::to_string(live.multiplier) +
         " backend=" + std::to_string(int(live.frameGenerationBackend)) +
         " (multiplier is only the pool floor here; the per-pair count sets the real width)");
     impl_->prefs[QStringLiteral("fgFixedTarget")] = next.enabled;
     impl_->prefs[QStringLiteral("fgFixedTargetFps")] = int(std::lround(next.targetFps));
-    impl_->prefs[QStringLiteral("fgFixedTargetSmoothing")] = next.smoothing;
-    impl_->prefs[QStringLiteral("fgFixedTargetClampMinMs")] = int(std::lround(next.clampMinMs));
-    impl_->prefs[QStringLiteral("fgFixedTargetClampMaxMs")] = int(std::lround(next.clampMaxMs));
+    impl_->prefs[QStringLiteral("fgFixedTargetCadence")] = int(next.cadence);
     if (!impl_->savePrefs()) veyra::log::warn("ui-prefs", std::string("fixed-target ")+what+" not saved");
     emit settingsChanged();
 }
@@ -406,22 +401,10 @@ void QmlPlayerBridge::setFgFixedTargetFps(int value) {
     next.targetFps = double(value);
     commitFixedTarget(next, "target rate");
 }
-void QmlPlayerBridge::setFgFixedTargetSmoothing(double value) {
+void QmlPlayerBridge::setFgFixedTargetCadence(int value) {
     auto next = settings().fgFixedTarget;
-    next.smoothing = value;
-    commitFixedTarget(next, "smoothing");
-}
-void QmlPlayerBridge::setFgFixedTargetClampMinMs(int value) {
-    auto next = settings().fgFixedTarget;
-    next.clampMinMs = double(value);
-    if (next.clampMaxMs < next.clampMinMs) next.clampMaxMs = next.clampMinMs;
-    commitFixedTarget(next, "clamp floor");
-}
-void QmlPlayerBridge::setFgFixedTargetClampMaxMs(int value) {
-    auto next = settings().fgFixedTarget;
-    next.clampMaxMs = double(value);
-    if (next.clampMinMs > next.clampMaxMs) next.clampMinMs = next.clampMaxMs;
-    commitFixedTarget(next, "clamp ceiling");
+    next.cadence = value == 1 ? engine::FixedTargetCadence::Latency : engine::FixedTargetCadence::Fixed;
+    commitFixedTarget(next, "cadence");
 }
 bool QmlPlayerBridge::dynamicHud() const { return settings().dynamicHud; }
 void QmlPlayerBridge::setDynamicHud(bool value) {

@@ -921,6 +921,8 @@ public:
     void setFgEnabled(bool on) { fgEnabled_ = on && !desc_.stillImage; }
     bool fgCreated() const;
     bool vfgFastReady() const;
+    // False when the installed VFG core has no Timestep parameter. AFG needs it.
+    bool vfgTimestepAvailable() const;
     engine::FailedBackend failedBackend() const { return failedBackend_; }
 
 private:

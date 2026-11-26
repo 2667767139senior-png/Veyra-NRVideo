@@ -123,7 +123,12 @@ struct VfgBackend::Impl {
     // [0] runs every subframe, or only the middle one of a mixed tier; [1]
     // (mixed tiers only) the others. Both share the stream, so their CUDA work
     // stays serial and the producer/completion fences are unchanged.
-    struct Effect {void* handle=nullptr;unsigned mode=1;uint64_t boundPair=0;unsigned boundMultiplier=0;};
+    struct Effect {void* handle=nullptr;unsigned mode=1;uint64_t boundPair=0;unsigned boundMultiplier=0;
+        // One discard evaluation after entering timestep mode. Measured on a
+        // real GPU (2026-11-26): the first Run after the selector becomes active
+        // lands off target (t=0.10 measured as ~0.27 on a 128 px move), the next
+        // ones within a few pixels. One extra Run per effect, never per frame.
+        bool timestepWarmed=false;};
     std::array<Effect,2> effects{};
     bool mixed=false;
     std::vector<HMODULE> libraries;
@@ -363,9 +368,21 @@ struct VfgBackend::Impl {
         const unsigned wantedMultiplier=timestepMode?0u:multiplier;
         if(ok&&e.boundMultiplier!=wantedMultiplier){
             ok=cv(cpuCall(7,[&]{return setU32(e.handle,"FrameMultiplier",wantedMultiplier);}),"SetU32 FrameMultiplier");
-            if(ok)e.boundMultiplier=wantedMultiplier;
+            if(ok){e.boundMultiplier=wantedMultiplier;e.timestepWarmed=false;}
         }
         ok=ok&&cv(cpuCall(5,[&]{return setImage(e.handle,"DstImage0",outputs[parity+2*(sub-1)].image);}),"SetImage output");
+        if(ok&&timestepMode&&!e.timestepWarmed){
+            // Warm-up: same pair, middle position, output discarded by the real
+            // Run below. Without it the first frame of a freshly switched effect
+            // is visibly misplaced - exactly the frame a user notices.
+            if(!setF32)ok=false;
+            else{
+                ok=cv(cpuCall(8,[&]{return setF32(e.handle,"Timestep",0.5f);}),"SetF32 Timestep warm-up")&&
+                   cv(cpuCall(9,[&]{return run(e.handle,1);}),"NvVFX_Run warm-up");
+                if(ok)e.timestepWarmed=true;
+                else log::warn("vfg","timestep warm-up failed; the first generated frame may be misplaced");
+            }
+        }
         if(ok){
             if(timestepMode){
                 if(!setF32){log::error("vfg","NvVFX_SetF32 unavailable; explicit timestep mode needs it");ok=false;}
@@ -704,6 +721,13 @@ bool VfgBackend::capture(ID3D12GraphicsCommandList* list,ID3D12Resource* texture
     ++p.inputRevision;return true;
 #else
     (void)list;(void)texture;(void)parity;(void)mode;return false;
+#endif
+}
+bool VfgBackend::timestepAvailable()const{
+#ifdef VEYRA_HAVE_CUDA_DRIVER_HEADERS
+    return impl_->ready&&impl_->setF32!=nullptr;
+#else
+    return false;
 #endif
 }
 bool VfgBackend::fastReady()const{

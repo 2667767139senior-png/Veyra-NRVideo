@@ -4580,12 +4580,12 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     }
     previousSource_=sourceFrameId;
     const bool fgBackendAvailable=fgEnabled_&&fgCreated();
-    // Fixed target (engine/FixedTargetSchedule.h): the caller already decided how
-    // many frames THIS interval needs - more for a long one, fewer for a short one -
-    // so the mode boils down to a per-pair multiplier: count+1, because the real
-    // frame closes the group. Everything below is then the multiplier path that has
-    // always shipped (slots, t = i/M, HUD pick, timestamps). count = 0 gives M = 1
-    // and fgCalls = 0, i.e. "generate nothing for this pair".
+    // AFG / fixed target (engine/FixedTargetSchedule.h): the caller owns an output
+    // grid and hands this pair the exact presentation time and VFG timestep of every
+    // frame it wants. count+1 is the group width only because the real frame closes
+    // the group; the positions are NOT i/(count+1), so the VFG branch below passes
+    // the plan's timestep instead of relying on FrameIndex. count = 0 gives M = 1 and
+    // fgCalls = 0, i.e. "generate nothing for this pair".
     const bool fixedTarget=fixedPlan!=nullptr&&vfgBackend_!=nullptr&&fgBackendAvailable;
     const unsigned fixedTicks=fixedTarget?std::min<unsigned>(fixedPlan->count,vfgSlotCount()-1u):0u;
     const unsigned fgMultiplier=fixedTarget?(fixedTicks+1u):
@@ -4737,8 +4737,13 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             // The group width comes from fgMultiplier, which for fixed target is
             // this pair's own frame count + 1, so VFG still runs its plain
             // FrameMultiplier/FrameIndex selection at t = sub/M.
+            // AFG: the position comes from the output grid, not from sub/width.
+            // A reset pair has no history to interpolate, so it stays on the plain
+            // 2X evaluation (timestep 0 = FrameMultiplier path).
+            const double timestep=!resetFg&&fixedTarget&&sub<=fixedPlan->count?
+                fixedPlan->timestep[sub-1]:0.0;
             if(!vfgBackend_->generate(parity,sub,resetFg?2u:outputMultiplier,resetFg,out.fgFast,
-                    0.0,-1)){failedBackend_=engine::FailedBackend::Fg;return false;}
+                    timestep,-1)){failedBackend_=engine::FailedBackend::Fg;return false;}
             auto* flist=ring_->acquireNext(slot,st);if(!flist)return false;
             tracker_.transition(flist,genFrame_[generatedSlot].Get(),D3D12_RESOURCE_STATE_COPY_DEST);
             if(!vfgBackend_->copyOutput(flist,genFrame_[generatedSlot].Get(),generatedSlot)){failedBackend_=engine::FailedBackend::Fg;return false;}
@@ -4755,11 +4760,15 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             if(previewCheckpoint&&!reset)previewCheckpoint();
             ++out.fgEvaluated;out.hasGenerated=!resetFg;out.genSlot=parity;
             out.genFenceValue=ring_->lastSignaledValue();out.genFenceObject=ring_->fence();
-            out.generatedPtsMs=prevPtsMs_+(ptsMs-prevPtsMs_)*double(sub)/double(outputMultiplier);
+            // The batch timestamp is the presentation time. For AFG that is the
+            // grid slot the scheduler assigned, never an i/M interpolation.
+            const int64_t generatedPts=fixedTarget&&sub<=fixedPlan->count&&fixedPlan->pts100ns[sub-1]>0?
+                fixedPlan->pts100ns[sub-1]:FrameBatch::interpolate(out.batch.a100ns,out.batch.b100ns,sub,outputMultiplier);
+            out.generatedPtsMs=double(generatedPts)/10000.0;
             if(out.hasGenerated){
                 ++metrics_.fgSubmittedCandidates;
                 BatchFrame f;f.identity=out.batch.identity;f.kind=FrameKind::Generated;f.validity=GenerationValidity::Pending;f.subframe=sub;
-                f.pts100ns=FrameBatch::interpolate(out.batch.a100ns,out.batch.b100ns,sub,outputMultiplier);
+                f.pts100ns=generatedPts;
                 f.lease=std::make_shared<FrameLease>();f.lease->texture=genFrame_[generatedSlot];f.lease->slot=generatedSlot;
                 f.lease->readyFence=out.genFenceValue;f.lease->readyFenceObject=out.genFenceObject;generatedLeases_[generatedSlot]=f.lease;out.batch.append(std::move(f));
             }
@@ -4866,7 +4875,12 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     out.videoSlot = parity;
     // The real frame keeps its own timestamp in every mode. Fixed target only
     // changes how many frames were generated before it, never when B is shown.
-    BatchFrame real;real.identity=out.batch.identity;real.pts100ns=out.batch.b100ns;real.lease=std::make_shared<FrameLease>();real.lease->texture=exclusionVideo_[parity]?exclusionVideo_[parity]:videoFrame_[parity];real.lease->sourceReference=sourceReferences_[parity];real.lease->baseReference=baseReferences_[parity];real.lease->slot=parity;real.lease->readyFence=out.videoFenceValue;real.lease->readyFenceObject=out.videoFenceObject;real.lease->referencesValid=retainReferences;realLeases_[parity]=real.lease;out.batch.append(std::move(real));
+    BatchFrame real;real.identity=out.batch.identity;
+    // AFG cadence: the real frame takes the first output slot at or after its own
+    // timestamp (never earlier), so every frame leaves on the same grid. The plan
+    // leaves this at 0 for the latency policy, which keeps the source timestamp.
+    real.pts100ns=fixedTarget&&fixedPlan->realPts100ns>out.batch.b100ns?fixedPlan->realPts100ns:out.batch.b100ns;
+    real.lease=std::make_shared<FrameLease>();real.lease->texture=exclusionVideo_[parity]?exclusionVideo_[parity]:videoFrame_[parity];real.lease->sourceReference=sourceReferences_[parity];real.lease->baseReference=baseReferences_[parity];real.lease->slot=parity;real.lease->readyFence=out.videoFenceValue;real.lease->readyFenceObject=out.videoFenceObject;real.lease->referencesValid=retainReferences;realLeases_[parity]=real.lease;out.batch.append(std::move(real));
     if(veyra::log::verboseFrameLogs())veyra::log::info("frame-batch",std::format("batch={} epoch={} revision={} source={} a={} b={} count={} realSlot={} realFence={} genSlot={} genFence={}",out.batch.batchId,epoch_,out.batch.identity.settingsRevision,out.batch.identity.sourceFrameId,out.batch.a100ns,out.batch.b100ns,out.batch.count,parity,out.videoFenceValue,out.genSlot,out.genFenceValue));
     if(pausedEligible&&lastAppliedSettings_){
         pausedNrCacheValid_=true;pausedNrFrame_=frame;pausedNrSourceId_=sourceFrameId;pausedNrPts_=ptsMs;
@@ -5139,6 +5153,7 @@ void EnhanceGraph::setNrEnabled(bool on)
 ID3D12Fence* EnhanceGraph::contextFence()const{return context_.fence();}
 uint32_t EnhanceGraph::actualFlowPerf()const{return nvof_?nvof_->caps().actualPerfLevel:0;}
 bool EnhanceGraph::vfgFastReady() const { return vfgBackend_&&vfgBackend_->fastReady(); }
+bool EnhanceGraph::vfgTimestepAvailable() const { return vfgBackend_&&vfgBackend_->timestepAvailable(); }
 bool EnhanceGraph::fgCreated() const
 {
     return (vfgBackend_&&vfgBackend_->created()) || fsrActive() || amfFrcActive() || rifeActive() || (fgBackend_ && fgBackend_->created());

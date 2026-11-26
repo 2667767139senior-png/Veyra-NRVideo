@@ -49,6 +49,11 @@ public:
     // chosen model and 0 the faster one (mixed tiers, fastReady()).
     bool generate(unsigned parity,unsigned subframe,unsigned multiplier,bool reset,bool fast=false,
                   double timestep=0.0,int primary=-1);
+    // True when the installed core exports NvVFX_SetF32, i.e. when the effect has
+    // a Timestep parameter at all. AFG must not run without it: it would generate
+    // at FrameIndex positions while stamping the frames with grid times, which is
+    // worse than not generating (judder with a correct-looking FPS counter).
+    bool timestepAvailable() const;
     // A second effect is loaded: a mixed tier's second model, or with fastFallback
     // the next faster model, for pairs the chosen one would finish too late for.
     bool fastReady() const;

@@ -1414,6 +1414,9 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             // accepted pair, on the deduplicated content clock. Configured from the
             // settings; disabled leaves every path below exactly as it was.
             FixedTargetScheduler fixedTarget;
+            // What actually left the presenter. Recorded on the live Present path
+            // only, so the numbers describe this session's output, not the graph.
+            AfgOutputPace afgPace;
             uint64_t nextFixedTargetLog=0;
             // Capture-card FG pairs: automatic deadline margin (0-1 ms) on top of the phase.
             LiveDeadlineMargin deadlineMargin;
@@ -3144,6 +3147,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     nextFgAdmissionLog=now+10000000;if(!admitted)nextFgRejectionLog=now+10000000;
                     veyra::log::info("live-fg-admission",std::format("timeline={} revision={} source={} multiplier={} requestedMultiplier={} admitted={} admittedPairs={} rejectedPairs={} remainingDeadlineMs={:.3f} firstDeadlineMs={:.3f} queuedGpuMs={:.3f} predictedMs={:.3f} elapsedMs={:.3f} blitGpuP95Ms={:.3f} presentCpuP95Ms={:.3f} warmingHistory={} (CPU Present is backpressure, not added GPU cost; firstDeadlineMs=-1 when unused)",timeline,batch.identity.settingsRevision,batch.identity.sourceFrameId,previewFgMultiplier,options.fgMultiplier,admitted,fgAdmittedPairs,fgRejectedPairs,double(deadline-now)/10000,firstDeadline?double(firstDeadline-now)/10000:-1,queuedMs,fgBudget.predicted(now,warmingHistory).value_or(-1),elapsed,blit,livePresent.p95(),warmingHistory));
                 };
+                if(hardFrameReset){fixedTarget.reset();afgPace.reset();}
                 if(fgBudgetRevision!=options.settings.revision||hardFrameReset){fgBudget.reset();vfgOverload.reset();vfgCostSettling.reset();vfgChosenFgMs=vfgFastFgMs=0;liveArrival.reset();pairLatency.reset();deadlineMargin.reset();fgRejectionHold.reset();fgBudgetRevision=options.settings.revision;displayFgGate.reset();}
                 previewFgMultiplier=options.fgMultiplier;
                 // An output cap used to only drop candidates at present time, so
@@ -3199,9 +3203,13 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 // nothing for that pair instead of M-1 frames in the middle of it.
                 FixedTargetPlan fixedPlan;
                 const FixedTargetPlan* fixedPlanPtr=nullptr;
+                // AFG places frames with VFG's Timestep parameter. A core that does
+                // not export NvVFX_SetF32 keeps multiplier mode; running the grid
+                // without it would stamp grid times on i/M positions.
                 const bool fixedEligible=options.fg&&options.settings.fgFixedTarget.enabled&&
                     options.settings.frameGenerationBackend==FrameGenerationBackend::Vfg&&
-                    !isImage&&!presentSinkFrameGeneration(options.settings.frameGenerationBackend);
+                    !isImage&&!presentSinkFrameGeneration(options.settings.frameGenerationBackend)&&
+                    graph->vfgTimestepAvailable();
                 // The mode, the rate and the smoothing knobs cannot be read from the
                 // settings revision: they are exempt from the rebuild comparison, so
                 // editing them mid-play does NOT bump it. Compare the struct instead.
@@ -3320,7 +3328,11 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         else if(!liveTimeline.anchored(batch.identity.epoch))liveTimeline.reset(batch.identity.epoch,batch.b100ns,liveInputReady,liveSourceInterval100ns(pkt.duration,activeSource->info().averageFps));
                         const auto interval=liveInterval;
                         const auto a=(historyReset||batch.b100ns<=batch.a100ns||batch.b100ns-batch.a100ns>10000000)?batch.b100ns-interval:batch.a100ns;
-                        const auto lastGenerated=pipeline::FrameBatch::interpolate(a,batch.b100ns,previewFgMultiplier-1,previewFgMultiplier);
+                        // AFG admits against the grid's own last slot: that is when this
+                        // pair's generated work must be done, not (M-1)/M of the interval.
+                        const auto lastGenerated=fixedPlanPtr&&fixedPlanPtr->count?
+                            fixedPlanPtr->pts100ns[fixedPlanPtr->count-1]:
+                            pipeline::FrameBatch::interpolate(a,batch.b100ns,previewFgMultiplier-1,previewFgMultiplier);
                         const auto now=host100ns();
                         const double elapsed=elapsedMs(processStart);
                         const auto earliest=now+fgBudget.requiredDeadlineLead(now,elapsed,presentP95,warmingHistory);
@@ -3390,10 +3402,14 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         if(fileAwaitingVideo)return pipeline::EnhanceGraph::FgDecision::Evaluate; // Bounded startup lookahead; audio has not started.
                         const auto interval=liveSourceInterval100ns(pkt.duration,activeSource->info().averageFps);
                         const auto a=(historyReset||batch.b100ns<=batch.a100ns||batch.b100ns-batch.a100ns>10000000)?batch.b100ns-interval:batch.a100ns;
-                        const auto lastGenerated=pipeline::FrameBatch::interpolate(a,batch.b100ns,previewFgMultiplier-1,previewFgMultiplier);
+                        const auto lastGenerated=fixedPlanPtr&&fixedPlanPtr->count?
+                            fixedPlanPtr->pts100ns[fixedPlanPtr->count-1]:
+                            pipeline::FrameBatch::interpolate(a,batch.b100ns,previewFgMultiplier-1,previewFgMultiplier);
                         const auto now=host100ns();
                         const auto media=int64_t(nowMs()*10000.0);
-                        const auto firstPts=pipeline::FrameBatch::interpolate(a,batch.b100ns,1,previewFgMultiplier);
+                        const auto firstPts=fixedPlanPtr&&fixedPlanPtr->count?
+                            fixedPlanPtr->pts100ns[0]:
+                            pipeline::FrameBatch::interpolate(a,batch.b100ns,1,previewFgMultiplier);
                         const auto firstDeadline=now+int64_t((firstPts-media)/playbackRate),deadline=now+int64_t((lastGenerated-media)/playbackRate);
                         const auto first=frameFlow->snapshot(now,false).gpuTiming[size_t(diagnostics::GpuStage::Fg1)].p95;
                         const auto elapsed=elapsedMs(processStart),blit=livePresentGpu.p95();
@@ -3475,12 +3491,25 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 previewSkipSinceProcess=false;
                 if(processed)lastProcessedPtsMs=pts;
                 if(processed&&fixedPlanPtr&&host100ns()>=nextFixedTargetLog){
+                    const auto pace=afgPace.summary();
+                    if(pace.samples>8)veyra::log::info("afg-output",std::format("targetFps={} samples={} intervalMs p50={:.2f} p95={:.2f} p99={:.2f} mean={:.2f} sd={:.2f} offCadence={} (measured between successful Present calls; offCadence counts intervals further than 10% from 1000/targetFps)",
+                        options.settings.fgFixedTarget.targetFps,pace.samples,pace.p50,pace.p95,pace.p99,pace.mean,pace.stddev,pace.offCadence));
                     nextFixedTargetLog=host100ns()+10000000;
                     const auto& st=fixedTarget.stats();
-                    veyra::log::info("fixed-target",std::format("revision={} targetFps={:.2f} contentFps={:.2f} sourceMs={:.3f} smoothedMs={:.3f} frames={} multiplier={} carry={:.2f} bypass={} reason={} intervals={} generated={} dropped={} bypassLong={} bypassAtTarget={} bypassOff={} (frames = generated frames for this pair, multiplier = frames+1 = the VFG group width, multiplier=1 means this pair generated nothing, carry = fractional frame handed to the next pair; the real frame is never moved)",
-                        options.settings.revision,options.settings.fgFixedTarget.targetFps,pairContentFps,st.lastSpanMs,st.lastSmoothedSpanMs,
-                        fixedPlanPtr->count,fixedPlanPtr->outputMultiplier,st.lastCarry,
-                        fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.ticks,st.droppedByCap,st.bypassLong,st.bypassAtTarget,st.bypassOff));
+                    // One line per second, enough to reconstruct the grid: slot times
+                    // and timesteps of this pair, the snap that cadence policy added,
+                    // and the counters that must stay flat when the output is healthy.
+                    std::string slots;
+                    for(unsigned i=0;i<fixedPlanPtr->count&&i<4;++i)
+                        slots+=std::format("{}{:.3f}@{:.3f}ms",i?",":"",
+                            fixedPlanPtr->timestep[i],double(fixedPlanPtr->pts100ns[i])/10000.0);
+                    veyra::log::info("fixed-target",std::format("revision={} mode=afg targetFps={:.2f} cadence={} contentFps={:.2f} sourceMs={:.3f} periodMs={:.3f} frames={} timestep[{}/{}]={} realSlotMs={:.3f} snapMs={:.3f} bypass={} reason={} intervals={} generated={} droppedCap={} droppedNear={} bypassLong={} bypassAtTarget={} bypassOff={} (frames = generated frames this pair; timestep[i]@ms = VFG Timestep and grid presentation time; realSlotMs = presentation time of the real frame; snapMs = delay the fixed cadence added to it)",
+                        options.settings.revision,options.settings.fgFixedTarget.targetFps,
+                        options.settings.fgFixedTarget.cadence==FixedTargetCadence::Latency?"latency":"fixed",
+                        pairContentFps,st.lastSpanMs,st.lastPeriodMs,
+                        fixedPlanPtr->count,fixedPlanPtr->count,fixedPlanPtr->outputMultiplier-1,slots,
+                        double(fixedPlanPtr->realPts100ns>0?fixedPlanPtr->realPts100ns:0)/10000.0,st.lastSnapMs,
+                        fixedPlanPtr->bypass?1:0,fixedPlanPtr->reason,st.intervals,st.generated,st.droppedCap,st.droppedNear,st.bypassLong,st.bypassAtTarget,st.bypassOff));
                 }
                 if(!processed){
                     const auto failedComponent=graph->failedBackend();
@@ -3735,7 +3764,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
 #ifdef VEYRA_ENABLE_XBOX
                         &xb,
 #endif
-                        &seekDecoded,&seekStarted,&seekDemuxDone,&audio,&audioPipe,&audioStarted,&cadence,&ctx,&fileAudioAlignPending,&fileAwaitingVideo,&fileInputEnded,&generatedDropCap,&generatedDropCapacity,&generatedDropDeadline,&playbackRate,&frameFlow,&graph,&host100ns,&isCapture,&isImage,&liveArrival,&livePresent,&liveScheduler,&nextFgDeadlineLog,&nowMs,&options,&pendingCompletions,&physicalCapture,&processingGraph,&presentEntryDeviation,&presentReturnDeviation,&presentationEffective,&presentationGeneration,&presentationSkippedGenerated,&presenter,&ring,&runSessionId,&seekPreviewPending,&observeFrameReady,&traceSubframe,&traceCpu,&captureStarting,&rawFirstPresent,&lastRawPresent,&firstEnhancedRevision,&retiredCapturePreview,&capturePreviewWindow,&rawSurfaceRevealed,privateTrace,traceSubframes,watch,step,timeline,captureArrival,sourceArrivalHost=pkt.arrivalHost100ns,baselineReady,delayEnhanced,activeSeekId,lineage,jobGeneration,rereadCached,sourceIntervalMs,submitThenPresent,generatedGrace=liveGeneratedGrace,smoothedCapacity=smoothTransportAnchor||smoothContentAnchor,halfRate,captureClockCorrected,driverPts100ns,flow=frameFlow,&deadlineMargin,marginPair,pairExtra](int64_t now)->LiveGpuScheduler::Step{
+                        &seekDecoded,&seekStarted,&seekDemuxDone,&audio,&audioPipe,&audioStarted,&cadence,&ctx,&fileAudioAlignPending,&fileAwaitingVideo,&fileInputEnded,&generatedDropCap,&generatedDropCapacity,&generatedDropDeadline,&playbackRate,&frameFlow,&graph,&host100ns,&isCapture,&isImage,&liveArrival,&livePresent,&liveScheduler,&nextFgDeadlineLog,&nowMs,&options,&pendingCompletions,&physicalCapture,&processingGraph,&presentEntryDeviation,&presentReturnDeviation,&presentationEffective,&presentationGeneration,&presentationSkippedGenerated,&presenter,&ring,&runSessionId,&seekPreviewPending,&observeFrameReady,&traceSubframe,&traceCpu,&captureStarting,&rawFirstPresent,&lastRawPresent,&firstEnhancedRevision,&retiredCapturePreview,&capturePreviewWindow,&rawSurfaceRevealed,privateTrace,traceSubframes,watch,step,timeline,captureArrival,sourceArrivalHost=pkt.arrivalHost100ns,baselineReady,delayEnhanced,activeSeekId,lineage,jobGeneration,rereadCached,sourceIntervalMs,submitThenPresent,generatedGrace=liveGeneratedGrace,smoothedCapacity=smoothTransportAnchor||smoothContentAnchor,halfRate,captureClockCorrected,driverPts100ns,flow=frameFlow,&deadlineMargin,marginPair,pairExtra,&afgPace,&fixedTarget](int64_t now)->LiveGpuScheduler::Step{
 
                         using State=LiveGpuScheduler::State;auto& batch=watch->output;auto& s=*step;
                         auto updatePending=[&](LiveStepState*){
@@ -3870,6 +3899,13 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                             presenter->reflexFrame(watch->reflexFrame);
                             presenter->observeHdrCoverage(hdrCoverageObserved_.load());
                             if(!presenter->present(ctx,ring,*graph,item.lease->slot,generated,item.lease->referencesValid,comparisonMode_,comparisonBase_,comparisonSplit_,item.identity,previewView(),item.pts100ns))return {State::Failed};
+                            // Sampled after a successful submit: an interval only counts
+                            // when a frame really went out.
+                            if(fixedTarget.config().enabled){
+                                const auto periodMs=options.settings.fgFixedTarget.targetFps>0?
+                                    1000.0/options.settings.fgFixedTarget.targetFps:0.0;
+                                afgPace.record(host100ns(),periodMs);
+                            }
                             const auto presentEndHost=host100ns();
                             const double returnDeviation=deviationValid?nowMs()-itemPtsMs:0;
                             item.lease->consumerFence=presenter->consumerFenceValue(ring.lastSignaledValue());const bool didPresent=presenter->submittedCount()>before;s.blit=presenter->blitTiming(ctx.fence());

@@ -296,9 +296,9 @@ QmlPlayerBridge::QmlPlayerBridge(engine::EngineController& engine, std::filesyst
             engine::FixedTargetConfig fixed = s.fgFixedTarget;
             if (p.contains(QStringLiteral("fgFixedTarget"))) fixed.enabled = p.value(QStringLiteral("fgFixedTarget")).toBool();
             if (p.contains(QStringLiteral("fgFixedTargetFps"))) fixed.targetFps = p.value(QStringLiteral("fgFixedTargetFps")).toDouble();
-            if (p.contains(QStringLiteral("fgFixedTargetSmoothing"))) fixed.smoothing = p.value(QStringLiteral("fgFixedTargetSmoothing")).toDouble();
-            if (p.contains(QStringLiteral("fgFixedTargetClampMinMs"))) fixed.clampMinMs = p.value(QStringLiteral("fgFixedTargetClampMinMs")).toDouble();
-            if (p.contains(QStringLiteral("fgFixedTargetClampMaxMs"))) fixed.clampMaxMs = p.value(QStringLiteral("fgFixedTargetClampMaxMs")).toDouble();
+            if (p.contains(QStringLiteral("fgFixedTargetCadence")))
+                fixed.cadence = p.value(QStringLiteral("fgFixedTargetCadence")).toInt() == 1
+                    ? engine::FixedTargetCadence::Latency : engine::FixedTargetCadence::Fixed;
             // The run cap is derived, not stored: a profile from before the panel
             // took arbitrary rates still has the historical four.
             fixed.maxRuns = engine::fixedTargetRunsFor(fixed.targetFps);

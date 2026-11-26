@@ -1748,46 +1748,17 @@ VPage {
                     }
                 }
                 VRow {
-                    label: qsTr("帧间隔平滑")
-                    objectName: "node-fg-fixed-target-smoothing"
+                    label: qsTr("输出节奏")
+                    objectName: "node-fg-fixed-target-cadence"
                     visible: veyra.fgFixedTarget
-                    hint: qsTr("0 关闭：帧生成位置严格按真实帧间隔算，速度最准。大于 0 会按钳位范围做指数平滑，画面节奏更稳但位置略有偏差")
-                    value: veyra.fgFixedTargetSmoothing <= 0 ? qsTr("关闭") : Number(veyra.fgFixedTargetSmoothing).toFixed(2)
-                    VSlider {
-                        objectName: "node-fg-fixed-target-smoothing-slider"
-                        implicitWidth: 110
-                        inputDecimals: 2
-                        from: 0; to: 0.9
-                        value: veyra.fgFixedTargetSmoothing
-                        onMoved: value => veyra.fgFixedTargetSmoothing = value
-                    }
-                }
-                VRow {
-                    label: qsTr("帧间隔下限")
-                    objectName: "node-fg-fixed-target-clamp-min"
-                    visible: veyra.fgFixedTarget && veyra.fgFixedTargetSmoothing > 0
-                    hint: qsTr("平滑时把源帧间隔至少当成这么久（毫秒）")
-                    value: veyra.fgFixedTargetClampMinMs + " ms"
-                    VSlider {
-                        objectName: "node-fg-fixed-target-clamp-min-slider"
-                        implicitWidth: 110
-                        from: 8; to: 60
-                        value: veyra.fgFixedTargetClampMinMs
-                        onMoved: value => veyra.fgFixedTargetClampMinMs = Math.round(value)
-                    }
-                }
-                VRow {
-                    label: qsTr("帧间隔上限")
-                    objectName: "node-fg-fixed-target-clamp-max"
-                    visible: veyra.fgFixedTarget && veyra.fgFixedTargetSmoothing > 0
-                    hint: qsTr("平滑时把源帧间隔最多当成这么久（毫秒）；超过 100 ms 的停顿不插帧")
-                    value: veyra.fgFixedTargetClampMaxMs + " ms"
-                    VSlider {
-                        objectName: "node-fg-fixed-target-clamp-max-slider"
-                        implicitWidth: 110
-                        from: 20; to: 90
-                        value: veyra.fgFixedTargetClampMaxMs
-                        onMoved: value => veyra.fgFixedTargetClampMaxMs = Math.round(value)
+                    hint: veyra.fgFixedTargetCadence === 0
+                          ? qsTr("固定网格：所有输出间隔恒定，真实帧最多延后一个槽位")
+                          : qsTr("低延迟：真实帧不移动，只填空隙，间隔不完全均匀")
+                    VSeg {
+                        objectName: "node-fg-fixed-target-cadence-seg"
+                        options: [{id:"0",label:qsTr("固定网格")},{id:"1",label:qsTr("低延迟")}]
+                        current: String(veyra.fgFixedTargetCadence)
+                        onPicked: id => veyra.fgFixedTargetCadence = Number(id)
                     }
                 }
                 VRow {

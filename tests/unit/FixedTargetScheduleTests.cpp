@@ -1,13 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Fixed-target frame generation (engine/FixedTargetSchedule.h): the adaptive
-// per-interval frame count, the carried remainder, the cap and the bypass rules.
+// AFG (engine/FixedTargetSchedule.h): the output grid, its timesteps, the snap
+// bound of each cadence policy, and the rules that keep a hiccup from becoming a
+// backlog.
 //
-// tools/fixed_target_sim.py runs the same cases over a wider matrix (target
-// 60-160 FPS x source 20-60 FPS x maxRuns 2-6); keep the two in step.
+// These are the properties the product promised, not just "50 FPS on average":
+//   - every output frame lands on the same grid, whatever the input jitter does;
+//   - a real frame is never shown before its own timestamp, and never a full
+//     period late;
+//   - a stall or a lost slot is dropped, never repaid;
+//   - the grid does not drift over a long run;
+//   - the legacy multiplier path is untouched when the mode is off.
 #include "veyra/engine/FixedTargetSchedule.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -19,231 +27,269 @@ static void check(bool ok, const std::string& label) {
 }
 static int64_t ms(double v) { return int64_t(v * 10000.0 + 0.5); }
 
-static FixedTargetConfig config(double target, unsigned maxRuns = 4) {
+static FixedTargetConfig config(double target, unsigned maxRuns = 0,
+                                FixedTargetCadence cadence = FixedTargetCadence::Fixed) {
     FixedTargetConfig c;
     c.enabled = true;
     c.targetFps = target;
-    c.maxRuns = maxRuns;
+    c.maxRuns = maxRuns ? maxRuns : fixedTargetRunsFor(target);
+    c.cadence = cadence;
     return c;
 }
 
-// Feeds a source cadence and returns every plan, exactly as the engine sees them
-// one pair at a time. Counts are the generated frames of each pair; the group VFG
-// runs with is count + 1 because the real frame closes it.
-static std::vector<FixedTargetPlan> run(FixedTargetScheduler& s, const std::vector<double>& spansMs,
-                                        int64_t start = ms(1000), double contentFps = 30.0) {
-    std::vector<FixedTargetPlan> out;
+// One source pair as the engine sees it, plus the plan made for it.
+struct Pair {
+    int64_t a = 0, b = 0;
+    FixedTargetPlan plan;
+};
+
+static std::vector<Pair> run(FixedTargetScheduler& s, const std::vector<double>& spansMs,
+                             int64_t start = ms(1000), double contentFps = 30.0) {
+    std::vector<Pair> out;
     int64_t a = start;
     for (double d : spansMs) {
-        const int64_t b = a + ms(d);
-        out.push_back(s.plan(a, b, contentFps));
-        a = b;
+        Pair p;
+        p.a = a;
+        p.b = a + ms(d);
+        p.plan = s.plan(p.a, p.b, contentFps);
+        out.push_back(p);
+        a = p.b;
     }
     return out;
 }
 
-// Output frames a cadence actually produced, over the wall time it covered: the
-// number the user reads off a frame counter (real frames included).
-static double observedFps(const std::vector<FixedTargetPlan>& plans, double totalMs) {
-    double frames = 0;
-    for (const auto& p : plans) frames += double(p.count) + (p.bypass ? 0.0 : 1.0);
-    return frames / (totalMs / 1000.0);
+// Every presented frame in order: generated slots first, then the real frame.
+struct Presented {
+    std::vector<int64_t> pts;
+    std::vector<double> timestep;   // 0 for real frames
+    size_t real = 0;
+};
+
+static Presented presented(const std::vector<Pair>& pairs) {
+    Presented out;
+    for (const auto& p : pairs) {
+        for (unsigned i = 0; i < p.plan.count; ++i) {
+            out.pts.push_back(p.plan.pts100ns[i]);
+            out.timestep.push_back(p.plan.timestep[i]);
+        }
+        out.pts.push_back(p.plan.realPts100ns);
+        out.timestep.push_back(0.0);
+        ++out.real;
+    }
+    return out;
 }
 
 int main() {
-    // Off by default: the caller sees the pair exactly as it came in.
+    // 30 -> 50: the shipped default. 200 generated frames per 300 pairs, and the
+    // union of generated and real frames is exactly one frame per 20 ms.
     {
         FixedTargetScheduler s;
-        const auto plan = s.plan(ms(1000), ms(1033), 30.0);
-        check(!plan.bypass && plan.count == 0 && plan.outputMultiplier == 1,
-              "disabled: no frames, and a group width of 1 (generate nothing)");
-        check(std::string(plan.reason) == "off", "disabled: reason=off");
-    }
+        s.configure(config(50.0));
+        const auto pairs = run(s, std::vector<double>(300, 1000.0 / 30.0));
+        unsigned generated = 0, empty = 0;
+        for (const auto& p : pairs) {
+            generated += p.plan.count;
+            if (p.plan.count == 0) ++empty;
+        }
+        check(generated == 200, "30->50: 300 pairs generate 200 frames (500 outputs in 10 s)");
+        check(empty == 100, "30->50: every third pair generates nothing");
 
-    // 30 FPS -> 80 FPS: 33.33 ms asks for 2.67 frames, so the group walks 3,2,3,2
-    // and the long-run output rate is the target, not the source times a constant.
-    {
-        FixedTargetScheduler s;
-        s.configure(config(80));
-        std::vector<double> spans(60, 1000.0 / 30.0);
-        const auto plans = run(s, spans);
-        bool countSane = true, uniform = true, monotonicT = true;
-        for (const auto& p : plans) {
-            if (p.count < 1 || p.count > 3) countSane = false;
-            for (unsigned i = 0; i < p.count; ++i) {
-                const double want = double(i + 1) / double(p.count + 1);
-                if (std::abs(p.t[i] - want) > 1e-9) uniform = false;
-                if (!(p.t[i] > 0.0 && p.t[i] < 1.0)) monotonicT = false;
-                if (i && !(p.t[i] > p.t[i - 1])) monotonicT = false;
+        const int64_t period = ms(20.0);
+        bool exact = true, monotonic = true, snapBounded = true, steps = true;
+        int64_t previous = std::numeric_limits<int64_t>::min();
+        for (const auto& p : pairs) {
+            if (p.plan.realPts100ns < p.b || p.plan.realPts100ns - p.b >= period) snapBounded = false;
+            for (unsigned k = 0; k < p.plan.count; ++k) {
+                const int64_t slot = p.plan.pts100ns[k];
+                if ((slot - pairs.front().a) % period != 0) exact = false;
+                if (slot <= previous) monotonic = false;
+                previous = slot;
+                const double expected = double(slot - p.a) / double(p.b - p.a);
+                if (!(p.plan.timestep[k] > 0.0 && p.plan.timestep[k] < 1.0)) steps = false;
+                if (std::abs(p.plan.timestep[k] - expected) > 1e-9) steps = false;
             }
+            if (p.plan.realPts100ns <= previous) monotonic = false;
+            previous = p.plan.realPts100ns;
         }
-        check(countSane, "30->80: 1-3 generated frames per pair");
-        check(uniform, "30->80: positions are i/(count+1), i.e. VFG's own t=i/M");
-        check(monotonicT, "30->80: every t inside (0,1) and rising");
-        const double fps = observedFps(plans, 60 * 1000.0 / 30.0);
-        check(std::abs(fps - 80.0) < 0.5, "30->80: average output rate is the target");
-        check(s.stats().droppedByCap == 0, "30->80: nothing dropped");
+        check(exact, "30->50: every slot is a whole 20 ms step from the origin");
+        check(steps, "30->50: every timestep equals (slot-a)/(b-a) and stays inside (0,1)");
+        check(monotonic, "30->50: presentation times strictly increase across pair boundaries");
+        check(snapBounded, "30->50: the real frame is never early and never a full period late");
+
+        // Consecutive presented frames exactly one period apart is the only claim
+        // that means "even cadence" rather than "50 FPS on average".
+        const auto all = presented(pairs);
+        bool even = all.pts.size() > 1;
+        for (size_t i = 1; i < all.pts.size(); ++i)
+            if (all.pts[i] - all.pts[i - 1] != period) even = false;
+        check(all.pts.size() == 500, "30->50: 500 presented frames in 10 s");
+        check(even, "30->50: presented interval is exactly 20 ms, not an average of 20 ms");
     }
 
-    // 30 FPS -> 50 FPS, the shipped default: 33.33 ms asks for 1.67 frames, so the
-    // count walks 1,0,1,1,0,1 and every third-ish pair generates NOTHING. This is
-    // the only target in the panel that reaches count = 0 on ordinary content, so
-    // it is also the only case that proves the "no Run for this pair" path.
+    // 25 -> 50: 40 ms is exactly two slots, so every pair generates one frame at
+    // t = 0.5 and the real frame needs no snap at all.
     {
         FixedTargetScheduler s;
-        s.configure(config(50, 2));
-        std::vector<double> spans(60, 1000.0 / 30.0);
-        const auto plans = run(s, spans);
-        unsigned empty = 0, filled = 0;
-        bool countSane = true, widthMatches = true;
-        for (const auto& p : plans) {
-            if (p.count > 1) countSane = false;
-            if (p.count == 0) ++empty; else ++filled;
-            if (p.outputMultiplier != p.count + 1) widthMatches = false;
-            for (unsigned i = 0; i < p.count; ++i)
-                if (std::abs(p.t[i] - 0.5) > 1e-9) widthMatches = false;
+        s.configure(config(50.0));
+        const auto pairs = run(s, std::vector<double>(40, 40.0), ms(1000), 25.0);
+        bool every = true, half = true, onGrid = true;
+        for (const auto& p : pairs) {
+            every = every && p.plan.count == 1;
+            half = half && std::abs(p.plan.timestep[0] - 0.5) < 1e-9;
+            onGrid = onGrid && p.plan.realPts100ns == p.b;
         }
-        check(countSane, "30->50: 0-1 generated frames per pair");
-        check(empty > 0 && filled > 0, "30->50: some pairs generate nothing, some generate one");
-        check(widthMatches, "30->50: group width is count+1 and t=0.5 when one frame is made");
-        const double fps = observedFps(plans, 60 * 1000.0 / 30.0);
-        check(std::abs(fps - 50.0) < 0.5, "30->50: average output rate is the target");
-        check(s.stats().droppedByCap == 0, "30->50: the cap never bites at two runs");
+        check(every, "25->50: one generated frame per 40 ms pair");
+        check(half, "25->50: it sits at t = 0.5");
+        check(onGrid, "25->50: 40 ms already lands on the grid, so the real frame is not delayed");
     }
 
-    // The wobble this mode exists for: 30 FPS dipping to 25 FPS. A constant
-    // multiplier drags the output down with it; the adaptive count does not.
+    // 25/30 jitter -> 50: the cadence is what must not move. Counts differ per
+    // pair; the presented grid never does.
     {
         FixedTargetScheduler s;
-        s.configure(config(80));
+        s.configure(config(50.0));
         std::vector<double> spans;
-        double totalMs = 0;
-        for (int i = 0; i < 40; ++i) {
-            const double d = (i % 2) ? 40.0 : 1000.0 / 30.0;   // 25 FPS / 30 FPS
-            spans.push_back(d); totalMs += d;
+        for (int i = 0; i < 120; ++i) spans.push_back(i % 3 == 0 ? 40.0 : 1000.0 / 30.0);
+        const auto pairs = run(s, spans, ms(1000), 27.0);
+        const auto all = presented(pairs);
+        const int64_t period = ms(20.0);
+        bool even = all.pts.size() > 10;
+        for (size_t i = 1; i < all.pts.size(); ++i)
+            if (all.pts[i] - all.pts[i - 1] != period) even = false;
+        check(even, "25/30 jitter -> 50: output intervals stay exactly 20 ms");
+        unsigned counts[3] = {0, 0, 0};
+        for (const auto& p : pairs) counts[std::min<unsigned>(p.plan.count, 2u)]++;
+        check(counts[0] > 0 && counts[1] > 0, "25/30 jitter -> 50: the per-pair count really varies");
+        check(counts[2] == 0, "25/30 jitter -> 50: no pair needs more than one frame");
+    }
+
+    // A stall is not repaid. 120 ms > maxIntervalMs, so the pair is bypassed and
+    // the grid re-anchors instead of owing three frames to the next pair.
+    {
+        FixedTargetScheduler s;
+        s.configure(config(50.0));
+        const std::vector<double> spans = {33.3, 33.3, 33.3, 120.0, 33.3, 33.3, 33.3};
+        const auto pairs = run(s, spans);
+        check(pairs[3].plan.bypass && std::string(pairs[3].plan.reason) == "longInterval",
+              "stall: the long pair is bypassed, not interpolated");
+        check(pairs[4].plan.count <= 2, "stall: the next pair is not charged for the gap");
+        check(pairs[4].plan.realPts100ns - pairs[4].b < ms(20.0),
+              "stall: the grid restarts in phase, no accumulated offset");
+    }
+
+    // Bypass rules that must not spend GPU.
+    {
+        FixedTargetScheduler s;
+        s.configure(config(30.0));
+        const auto pairs = run(s, std::vector<double>(10, 1000.0 / 30.0), ms(1000), 30.0);
+        check(pairs[0].plan.bypass && std::string(pairs[0].plan.reason) == "sourceAtTarget",
+              "source already at the target: bypass");
+        FixedTargetScheduler zero;
+        zero.configure(config(0.0));
+        const auto z = run(zero, std::vector<double>(4, 33.3));
+        check(z[1].plan.bypass && std::string(z[1].plan.reason) == "targetOff", "target 0: bypass");
+        FixedTargetScheduler bad;
+        bad.configure(config(50.0));
+        run(bad, std::vector<double>(3, 33.3));
+        const FixedTargetPlan same = bad.plan(ms(2000), ms(2000), 30.0);
+        check(same.bypass && std::string(same.reason) == "interval", "zero-length interval: bypass");
+    }
+
+    // The latency policy keeps real timestamps and accepts an uneven union; the
+    // fixed policy is the one that guarantees the 20 ms grid.
+    {
+        FixedTargetScheduler s;
+        s.configure(config(50.0, 0, FixedTargetCadence::Latency));
+        const auto pairs = run(s, std::vector<double>(60, 1000.0 / 30.0));
+        bool noRetime = true;
+        for (const auto& p : pairs) noRetime = noRetime && p.plan.realPts100ns == 0;
+        check(noRetime, "latency policy: real frames keep their own timestamps");
+        check(s.stats().lastSnapMs == 0.0, "latency policy: reported snap is zero");
+        // Same source, fixed policy: the real frame does move.
+        FixedTargetScheduler f;
+        f.configure(config(50.0));
+        const auto fp = run(f, std::vector<double>(60, 1000.0 / 30.0));
+        bool someRetime = false;
+        for (const auto& p : fp) someRetime = someRetime || p.plan.realPts100ns > p.b;
+        check(someRetime, "fixed policy: real frames are snapped onto the grid");
+    }
+
+    // Cap: a target the GPU cannot fill per pair must drop slots instead of
+    // owing them. 15 FPS (66.7 ms) at 160 FPS asks for ten frames; the cap keeps
+    // seven. (20 FPS at 160 is exactly 8-wide and must NOT drop - it is the
+    // boundary the pool was sized for.)
+    {
+        FixedTargetScheduler s;
+        s.configure(config(160.0));
+        const auto pairs = run(s, std::vector<double>(20, 66.7), ms(1000), 15.0);
+        const auto st = s.stats();
+        bool within = true;
+        for (const auto& p : pairs) within = within && p.plan.count <= kFixedTargetMaxTicks;
+        check(within, "cap: a pair never plans more frames than the slot pool holds");
+        check(st.droppedCap > 0, "cap: slots past the cap are counted as dropped");
+    }
+
+    // No drift: 29.97 in, 50 out, five minutes. Slot times stay exact multiples
+    // of the period from the origin and the generated count matches the rate.
+    {
+        FixedTargetScheduler s;
+        s.configure(config(50.0));
+        const double span = 1000.0 / 29.97;
+        const auto pairs = run(s, std::vector<double>(9000, span), ms(1000), 29.97);
+        const int64_t period = ms(20.0);
+        bool exact = true, bounded = true;
+        for (const auto& p : pairs) {
+            for (unsigned k = 0; k < p.plan.count; ++k)
+                if ((p.plan.pts100ns[k] - pairs.front().a) % period != 0) exact = false;
+            if ((p.plan.realPts100ns - pairs.front().a) % period != 0) bounded = false;
         }
-        const auto plans = run(s, spans);
-        const double fps = observedFps(plans, totalMs);
-        check(std::abs(fps - 80.0) < 0.6, "25/30 wobble at 80: the rate stays on target");
-        unsigned long long shortSum = 0, longSum = 0;
-        for (size_t i = 0; i < plans.size(); ++i) ((i % 2) ? longSum : shortSum) += plans[i].count + 1;
-        check(longSum > shortSum, "25/30 wobble: the longer intervals really do get more frames");
+        check(exact, "5 min at 29.97 -> 50: generated slots never drift off the grid");
+        check(bounded, "5 min at 29.97 -> 50: real frames stay on the grid too");
+        const auto st = s.stats();
+        const double expected = 9000.0 * span / 1000.0 * 50.0 + 9000.0;
+        const double actual = double(st.generated) + 9000.0;
+        check(std::abs(actual - expected) / expected < 0.01,
+              "5 min at 29.97 -> 50: output count matches the target rate within 1%");
     }
 
-    // 40 ms at 80 FPS is 3.2 frames: two generated, 0.2 carried. The carried
-    // remainder is what makes the average exact instead of 3.0.
+    // Legacy multiplier mode must be untouched: with the mode off the graph is
+    // sized exactly as the user asked, and no plan alters anything.
     {
+        const FixedTargetConfig off;
+        check(fixedTargetCapacity(off, 3) == 3, "legacy: a disabled config does not resize the VFG pool");
+        check(fixedTargetCapacity(off, 1) == 1, "legacy: multiplier 1 stays 1");
         FixedTargetScheduler s;
-        s.configure(config(80));
-        const auto plans = run(s, std::vector<double>(5, 40.0));
-        const unsigned sum = plans[0].count + plans[1].count + plans[2].count + plans[3].count + plans[4].count;
-        check(sum == 11, "40 ms pairs: 2/2/3/2/2 generated -> 16 output frames over 200 ms");
-        check(s.stats().lastCarry > -1.0 && s.stats().lastCarry < 1.0, "the carried remainder stays under one frame");
+        s.configure(off);
+        const FixedTargetPlan p = s.plan(0, ms(33.3), 30.0);
+        check(p.bypass && p.count == 0 && p.realPts100ns == 0, "legacy: an off scheduler plans nothing");
+        check(fixedTargetCapacity(config(50.0), 2) == 3, "afg: the pool covers maxRuns + 1");
+        check(fixedTargetCapacity(config(160.0), 2) == 8, "afg: 160 FPS sizes an 8-wide group");
+        check(fixedTargetSameStructure(config(50.0, 2), config(80.0, 2)),
+              "afg: a rate change keeps the same graph structure");
+        check(!fixedTargetSameStructure(config(50.0, 2), config(50.0, 4)),
+              "afg: a cap change does rebuild the graph");
     }
 
-    // Cap: 20 FPS content at 160 FPS wants 8 frames; the cap must drop frames and
-    // forget the debt, never owe them back as latency.
+    // Validation keeps hand-edited profiles out of the scheduler.
     {
-        FixedTargetScheduler s;
-        s.configure(config(160, 6));
-        const auto plans = run(s, std::vector<double>(20, 50.0), ms(1000), 20.0);
-        bool capped = true;
-        for (const auto& p : plans) if (p.count > 6) capped = false;
-        check(capped, "20->160: no pair exceeds maxRuns");
-        check(s.stats().droppedByCap > 0, "20->160: the overflow is counted as dropped");
-        check(std::abs(s.stats().lastCarry) < 1e-9, "the cap leaves no debt behind");
-        check(plans.back().count == 6, "the pairs after a capped one ask for the same, not for more");
-    }
-
-    // A stall: no interpolation across it, and the remainder is forgotten.
-    {
-        FixedTargetScheduler s;
-        s.configure(config(80));
-        run(s, std::vector<double>(3, 1000.0 / 30.0));
-        const auto stall = s.plan(ms(2000), ms(2000) + ms(120), 30.0);
-        check(stall.bypass && stall.count == 0, "120 ms gap: bypassed, no frames generated");
-        check(std::string(stall.reason) == "longInterval", "120 ms gap: reason=longInterval");
-        const auto after = s.plan(ms(2000) + ms(120), ms(2000) + ms(120) + ms(1000.0 / 30.0), 30.0);
-        check(!after.bypass && after.count >= 1 && after.count <= 3, "after a stall the next normal pair plans normally");
-    }
-
-    // Source already at or above the target (menus, a real 60 FPS source).
-    {
-        FixedTargetScheduler s;
-        s.configure(config(60));
-        const auto plan = s.plan(ms(1000), ms(1016), 60.0);
-        check(plan.bypass && plan.count == 0, "60 FPS source at a 60 FPS target: auto bypass");
-        check(std::string(plan.reason) == "sourceAtTarget", "auto bypass reports sourceAtTarget");
-        check(s.stats().bypassAtTarget == 1, "auto bypass is counted");
-    }
-
-    // 0 is the panel's "insert nothing", not an error and not a division.
-    {
-        FixedTargetScheduler s;
-        s.configure(config(0));
-        const auto plan = s.plan(ms(1000), ms(1040), 25.0);
-        check(plan.bypass && plan.count == 0, "target 0: bypassed");
-        check(std::string(plan.reason) == "targetOff", "target 0: reason=targetOff");
-    }
-
-    // Non-positive intervals come from a reset or a duplicate, never from a plan.
-    {
-        FixedTargetScheduler s;
-        s.configure(config(80));
-        check(s.plan(ms(1000), ms(1000), 30.0).bypass, "zero-length interval: bypassed");
-        check(s.plan(ms(1000), ms(990), 30.0).bypass, "negative interval: bypassed");
-    }
-
-    // Smoothing: with 0 the exact span decides; a clamped average damps the count.
-    {
-        FixedTargetScheduler plain, smooth;
-        plain.configure(config(80));
-        auto c = config(80);
-        c.smoothing = 0.6;
-        c.clampMinMs = 30;
-        c.clampMaxMs = 45;
-        smooth.configure(c);
-        const std::vector<double> spans = {40.0, 25.0, 25.0, 40.0};
-        const auto a = run(plain, spans);
-        const auto b = run(smooth, spans);
-        check(a[1].count < b[1].count, "smoothing keeps the count from collapsing after one short interval");
-        check(smooth.stats().lastSmoothedSpanMs > 25.0, "the smoothed span stays inside the clamps");
-    }
-
-    // Structure, capacity and validation.
-    {
-        check(fixedTargetRunsFor(80) == 4, "runsFor(80) keeps the historical four");
-        check(fixedTargetRunsFor(120) == 5, "runsFor(120) covers 40 ms at 120 FPS");
-        check(fixedTargetRunsFor(160) == 6, "runsFor(160) is the ceiling");
-        FixedTargetConfig c = config(100, 4);
-        check(fixedTargetCapacity(c, 2) == 5, "capacity covers maxRuns + the real frame");
-        check(fixedTargetCapacity(c, 8) == 8, "a larger requested multiplier is kept");
-        c.maxRuns = kFixedTargetMaxTicks;
-        check(fixedTargetCapacity(c, 2) == kFixedTargetMaxTicks + 1, "capacity follows maxRuns");
-        FixedTargetConfig off;
-        check(fixedTargetCapacity(off, 2) == 2, "multiplier mode keeps the requested multiplier");
-        check(fixedTargetSameStructure(config(80), config(144)), "the rate is not structural");
-        check(!fixedTargetSameStructure(config(80), config(80, 6)), "the cap is structural");
-
-        FixedTargetConfig v = config(80);
-        check(fixedTargetValid(v), "a normal config is valid");
-        v.targetFps = 0;
+        check(fixedTargetValid(FixedTargetConfig{}), "the disabled config is always valid");
+        FixedTargetConfig v = config(50.0);
+        check(fixedTargetValid(v), "the default AFG config is valid");
+        v = config(50.0); v.targetFps = 0;
         check(fixedTargetValid(v), "target 0 is valid (it means insert nothing)");
-        v = config(80); v.targetFps = 481;
+        v = config(50.0); v.targetFps = 481;
         check(!fixedTargetValid(v), "a target above 480 is rejected");
-        v = config(80); v.maxRuns = 0;
+        v = config(50.0); v.maxRuns = 0;
         check(!fixedTargetValid(v), "maxRuns 0 is rejected");
-        v = config(80); v.smoothing = 1.5;
-        check(!fixedTargetValid(v), "smoothing outside 0..1 is rejected");
-        v = config(80); v.clampMaxMs = 10;
-        check(!fixedTargetValid(v), "a clamp ceiling below the floor is rejected");
-        v = config(80); v.maxIntervalMs = 30;
-        check(!fixedTargetValid(v), "maxIntervalMs below the clamp ceiling is rejected");
-        FixedTargetConfig disabled;
-        check(fixedTargetValid(disabled), "the disabled config is always valid");
+        v = config(50.0); v.maxRuns = kFixedTargetMaxTicks + 1;
+        check(!fixedTargetValid(v), "maxRuns past the slot pool is rejected");
+        v = config(50.0); v.maxIntervalMs = 10;
+        check(!fixedTargetValid(v), "a max interval below one period is rejected");
+        check(fixedTargetRunsFor(50.0) == 2, "50 FPS asks for at most two frames per pair");
+        check(fixedTargetRunsFor(160.0) == 7, "160 FPS asks for seven");
     }
 
-    if (failures == 0) std::printf("all fixed-target schedule tests passed\n");
-    else std::printf("%d fixed-target schedule test(s) failed\n", failures);
+    if (failures == 0) std::printf("all AFG schedule tests passed\n");
+    else std::printf("%d AFG schedule test(s) failed\n", failures);
     return failures == 0 ? 0 : 1;
 }
