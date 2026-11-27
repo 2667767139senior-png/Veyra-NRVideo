@@ -176,6 +176,15 @@ jobs:
           & C:\b\veyra_effect_chain_tests.exe
           if ($LASTEXITCODE -ne 0) { throw "veyra_effect_chain_tests failed with $LASTEXITCODE" }
 
+      # The first real pair after a graph rebuild is (0, sourceTime), not a pair.
+      # Generating a timestamp for it used to throw out of the run loop and end
+      # playback on every VFG pool rebuild, so the window rule is gated here.
+      - name: Run frame-batch window tests
+        run: |
+          cmake --build C:\b --target veyra_frame_batch_window_tests
+          & C:\b\veyra_frame_batch_window_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "veyra_frame_batch_window_tests failed with $LASTEXITCODE" }
+
       # Built here, run on a machine that actually has the runtime: CI has no GPU,
       # and whether VFG's timestep mode places a frame where it was asked to is
       # what the AFG scheduler rests on.

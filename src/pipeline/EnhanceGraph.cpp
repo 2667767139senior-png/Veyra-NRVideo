@@ -4770,18 +4770,31 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
             if(previewCheckpoint&&!reset)previewCheckpoint();
             ++out.fgEvaluated;out.hasGenerated=!resetFg;out.genSlot=parity;
             out.genFenceValue=ring_->lastSignaledValue();out.genFenceObject=ring_->fence();
-            // The batch timestamp is the presentation time. For AFG that is the
-            // grid slot the scheduler assigned, never an i/M interpolation.
-            const int64_t generatedPts=fixedTarget&&sub<=fixedPlan->count&&fixedPlan->pts100ns[sub-1]>0?
-                fixedPlan->pts100ns[sub-1]:FrameBatch::interpolate(out.batch.a100ns,out.batch.b100ns,sub,outputMultiplier);
-            out.generatedPtsMs=double(generatedPts)/10000.0;
             if(out.hasGenerated){
+                // The batch timestamp is the presentation time. For AFG that is
+                // the grid slot the scheduler assigned, never an i/M interpolation.
+                // This computation must stay inside hasGenerated. A reset pair has no
+                // usable A/B interval at all: warmCapture() leaves prevPtsMs_ at 0 and
+                // clears prevValid_, while the first real frame carries the source
+                // timeline, so a = 0 and b = ~1e9. FrameBatch::interpolate() rejects
+                // any window wider than one second and its exception reached the run
+                // loop as "invalid interpolation interval", ending playback on the
+                // first pair after every VFG pool rebuild.
+                const int64_t generatedPts=fixedTarget&&sub<=fixedPlan->count&&fixedPlan->pts100ns[sub-1]>0?
+                    fixedPlan->pts100ns[sub-1]:FrameBatch::interpolate(out.batch.a100ns,out.batch.b100ns,sub,outputMultiplier);
+                out.generatedPtsMs=double(generatedPts)/10000.0;
                 ++metrics_.fgSubmittedCandidates;
                 BatchFrame f;f.identity=out.batch.identity;f.kind=FrameKind::Generated;f.validity=GenerationValidity::Pending;f.subframe=sub;
                 f.pts100ns=generatedPts;
                 if(fixedTarget&&sub<=fixedPlan->count){f.gridSlot=fixedPlan->slotIndex[sub-1];f.timestep=fixedPlan->timestep[sub-1];}
                 f.lease=std::make_shared<FrameLease>();f.lease->texture=genFrame_[generatedSlot];f.lease->slot=generatedSlot;
                 f.lease->readyFence=out.genFenceValue;f.lease->readyFenceObject=out.genFenceObject;generatedLeases_[generatedSlot]=f.lease;out.batch.append(std::move(f));
+            }else{
+                // Reset pair: VFG ran once to seed history but produced nothing that
+                // can be presented. Such a pair has no usable A/B window (see above),
+                // so B is the only honest timestamp here.
+                out.generatedPtsMs=ptsMs;
+                veyra::log::warn("vfg",std::format("reset-pair seeded without in-between frame sub={} a={} b={} (A/B window not usable; no interpolation attempted)",sub,out.batch.a100ns,out.batch.b100ns));
             }
             continue;
         }

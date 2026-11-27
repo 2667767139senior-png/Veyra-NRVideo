@@ -141,6 +141,11 @@ add_executable(veyra_private_frame_trace_tests tests/unit/PrivateFrameTraceTests
 target_compile_features(veyra_private_frame_trace_tests PRIVATE cxx_std_20)
 target_link_libraries(veyra_private_frame_trace_tests PRIVATE veyra_base)
 
+# Which A/B pairs may carry generated frames (header-only: FrameBatch.h).
+add_executable(veyra_frame_batch_window_tests tests/unit/FrameBatchWindowTests.cpp)
+target_compile_features(veyra_frame_batch_window_tests PRIVATE cxx_std_20)
+target_link_libraries(veyra_frame_batch_window_tests PRIVATE veyra_base)
+
 # On-screen text reading for live translation (OCR passes, cleanup, line timing),
 # with a scripted OCR engine: no GPU, no Windows OCR language needed.
 add_executable(veyra_screen_text_tests tests/unit/ScreenTextTests.cpp src/engine/ScreenText.cpp)

@@ -55,9 +55,18 @@ struct FrameBatch {
     uint32_t count=0;
     static int64_t interpolate(int64_t a,int64_t b,uint32_t j,uint32_t n) {
         // The application accepts at most one second between continuous endpoints.
-        if(n<2||n>Capacity||j==0||j>=n||b<=a||a>INT64_MAX-10000000||b>a+10000000)
+        if(n<2||n>Capacity||j==0||j>=n||!pairInterpolable(a,b)||a>INT64_MAX-10000000)
             throw std::invalid_argument("invalid interpolation interval");
         const int64_t d=b-a;return a+(d/n)*j+((d%n)*j+n/2)/n;
+    }
+    // A pair can carry generated frames only when its endpoints form a usable
+    // window. This is not a tolerance: warmCapture() leaves prevPtsMs_ at 0 and
+    // clears prevValid_ on purpose, so the first real pair after a graph rebuild
+    // is (0, sourceTime). Treating that as a pair asks for a timestamp a hundred
+    // seconds before the source, and interpolate() refusing it used to surface as
+    // a run-loop failure that ended playback after every rebuild.
+    static bool pairInterpolable(int64_t a,int64_t b) {
+        return b>a&&b-a<=10000000;
     }
     void append(BatchFrame frame) {
         if(count>=frames.size()||frame.identity!=identity||(count&&frame.pts100ns<=frames[count-1].pts100ns))
